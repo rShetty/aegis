@@ -1,57 +1,63 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
   <defs>
-    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" style="stop-color:#0a0e1a;stop-opacity:1" />
-      <stop offset="100%" style="stop-color:#0d1b2a;stop-opacity:1" />
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0d1b2a;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#1b2a4a;stop-opacity:1" />
     </linearGradient>
-    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="100%">
+    <linearGradient id="cyanGrad" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" style="stop-color:#00d4ff;stop-opacity:1" />
-      <stop offset="100%" style="stop-color:#0077b6;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#0096c7;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="brickGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#48cae4;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#00b4d8;stop-opacity:1" />
     </linearGradient>
   </defs>
 
   <!-- Background: shield (protection/enforcement) -->
   <path d="M256 40 L430 100 L430 250 Q430 380 256 470 Q82 380 82 250 L82 100 Z"
-        fill="url(#bg)" stroke="url(#accent)" stroke-width="3"/>
+        fill="url(#bgGrad)" stroke="#48cae4" stroke-width="5"/>
 
   <!-- Inner shield -->
   <path d="M256 60 L410 112 L410 250 Q410 365 256 445 Q102 365 102 250 L102 112 Z"
-        fill="none" stroke="#00d4ff" stroke-width="1" stroke-opacity="0.3"/>
-
-  <!-- Firewall wall (network egress control) -->
-  <g transform="translate(256, 220)">
-    <!-- Wall bricks -->
-    <rect x="-70" y="-40" width="30" height="20" rx="2" fill="url(#accent)" opacity="0.8"/>
-    <rect x="-35" y="-40" width="30" height="20" rx="2" fill="url(#accent)" opacity="0.6"/>
-    <rect x="0" y="-40" width="30" height="20" rx="2" fill="url(#accent)" opacity="0.8"/>
-    <rect x="35" y="-40" width="30" height="20" rx="2" fill="url(#accent)" opacity="0.6"/>
-
-    <rect x="-70" y="-15" width="30" height="20" rx="2" fill="url(#accent)" opacity="0.6"/>
-    <rect x="-35" y="-15" width="30" height="20" rx="2" fill="url(#accent)" opacity="0.8"/>
-    <rect x="0" y="-15" width="30" height="20" rx="2" fill="url(#accent)" opacity="0.6"/>
-    <rect x="35" y="-15" width="30" height="20" rx="2" fill="url(#accent)" opacity="0.8"/>
-
-    <rect x="-70" y="10" width="30" height="20" rx="2" fill="url(#accent)" opacity="0.8"/>
-    <rect x="-35" y="10" width="30" height="20" rx="2" fill="url(#accent)" opacity="0.6"/>
-    <rect x="0" y="10" width="30" height="20" rx="2" fill="url(#accent)" opacity="0.8"/>
-    <rect x="35" y="10" width="30" height="20" rx="2" fill="url(#accent)" opacity="0.6"/>
-
-    <!-- Blocked arrow (egress denied) -->
-    <path d="M 0 50 L 0 80" stroke="#00d4ff" stroke-width="3" fill="none"/>
-    <path d="M -10 70 L 0 80 L 10 70" stroke="#00d4ff" stroke-width="3" fill="none" stroke-linecap="round"/>
-    <circle cx="0" cy="65" r="18" fill="none" stroke="#e94560" stroke-width="3"/>
-    <line x1="-13" y1="52" x2="13" y2="78" stroke="#e94560" stroke-width="3" stroke-linecap="round"/>
-  </g>
+        fill="none" stroke="#00d4ff" stroke-width="2" stroke-opacity="0.5"/>
 
   <!-- Network nodes (connected system) -->
-  <g fill="#00d4ff" opacity="0.7">
-    <circle cx="130" cy="140" r="5"/>
-    <circle cx="382" cy="140" r="5"/>
-    <line x1="130" y1="140" x2="190" y2="190" stroke="#00d4ff" stroke-width="1.5" opacity="0.4"/>
-    <line x1="382" y1="140" x2="322" y2="190" stroke="#00d4ff" stroke-width="1.5" opacity="0.4"/>
+  <g fill="#48cae4" opacity="0.9">
+    <circle cx="130" cy="140" r="6"/>
+    <circle cx="382" cy="140" r="6"/>
+    <line x1="130" y1="140" x2="190" y2="195" stroke="#48cae4" stroke-width="2" opacity="0.6"/>
+    <line x1="382" y1="140" x2="322" y2="195" stroke="#48cae4" stroke-width="2" opacity="0.6"/>
+  </g>
+
+  <!-- Firewall wall (network egress control) -->
+  <g transform="translate(256, 230)">
+    <!-- Row 1 -->
+    <rect x="-72" y="-42" width="32" height="22" rx="3" fill="url(#brickGrad)" stroke="#00d4ff" stroke-width="1"/>
+    <rect x="-36" y="-42" width="32" height="22" rx="3" fill="url(#brickGrad)" opacity="0.8" stroke="#00d4ff" stroke-width="1"/>
+    <rect x="0" y="-42" width="32" height="22" rx="3" fill="url(#brickGrad)" stroke="#00d4ff" stroke-width="1"/>
+    <rect x="36" y="-42" width="32" height="22" rx="3" fill="url(#brickGrad)" opacity="0.8" stroke="#00d4ff" stroke-width="1"/>
+
+    <!-- Row 2 -->
+    <rect x="-72" y="-16" width="32" height="22" rx="3" fill="url(#brickGrad)" opacity="0.8" stroke="#00d4ff" stroke-width="1"/>
+    <rect x="-36" y="-16" width="32" height="22" rx="3" fill="url(#brickGrad)" stroke="#00d4ff" stroke-width="1"/>
+    <rect x="0" y="-16" width="32" height="22" rx="3" fill="url(#brickGrad)" opacity="0.8" stroke="#00d4ff" stroke-width="1"/>
+    <rect x="36" y="-16" width="32" height="22" rx="3" fill="url(#brickGrad)" stroke="#00d4ff" stroke-width="1"/>
+
+    <!-- Row 3 -->
+    <rect x="-72" y="10" width="32" height="22" rx="3" fill="url(#brickGrad)" stroke="#00d4ff" stroke-width="1"/>
+    <rect x="-36" y="10" width="32" height="22" rx="3" fill="url(#brickGrad)" opacity="0.8" stroke="#00d4ff" stroke-width="1"/>
+    <rect x="0" y="10" width="32" height="22" rx="3" fill="url(#brickGrad)" stroke="#00d4ff" stroke-width="1"/>
+    <rect x="36" y="10" width="32" height="22" rx="3" fill="url(#brickGrad)" opacity="0.8" stroke="#00d4ff" stroke-width="1"/>
+
+    <!-- Blocked arrow (egress denied) -->
+    <path d="M 0 50 L 0 82" stroke="#48cae4" stroke-width="3.5" fill="none"/>
+    <path d="M -11 70 L 0 82 L 11 70" stroke="#48cae4" stroke-width="3.5" fill="none" stroke-linecap="round"/>
+    <circle cx="0" cy="66" r="20" fill="none" stroke="#ff4d6d" stroke-width="4"/>
+    <line x1="-14" y1="52" x2="14" y2="80" stroke="#ff4d6d" stroke-width="4" stroke-linecap="round"/>
   </g>
 
   <!-- Text -->
-  <text x="256" y="490" text-anchor="middle" font-family="Helvetica, Arial, sans-serif"
-        font-size="26" font-weight="bold" fill="#00d4ff" letter-spacing="6">AEGIS</text>
+  <text x="256" y="492" text-anchor="middle" font-family="Helvetica, Arial, sans-serif"
+        font-size="26" font-weight="bold" fill="#48cae4" letter-spacing="6">AEGIS</text>
 </svg>
