@@ -99,6 +99,32 @@ Aegis checks each outbound request against:
 
 If any check fails, the request is blocked and logged.
 
+## Ecosystem
+
+Aegis is part of a six-project AI governance ecosystem for enterprises:
+
+| Project | Role | Repo |
+|---|---|---|
+| **Hive** | Agent runtime & orchestration | [rShetty/hive](https://github.com/rShetty/hive) |
+| **Patroclus** | Authorization infrastructure | [rShetty/patroclus](https://github.com/rShetty/patroclus) |
+| **Relay** | MCP gateway & tool proxy | [rShetty/relay](https://github.com/rShetty/relay) |
+| **Miser** | LLM cost optimization | [rShetty/miser](https://github.com/rShetty/miser) |
+| **Sentiel** | Observability, DLP & compliance | [rShetty/sentiel](https://github.com/rShetty/sentiel) |
+| **Aegis** | Network egress & attestation | [rShetty/Aegis](https://github.com/rShetty/Aegis) |
+
+Aegis enforces network-level controls that complement Patroclus's policy-level
+authorization. While Patroclus controls *which tools* an agent can use, Aegis
+controls *which network destinations* an agent can reach — preventing agents
+from bypassing Relay to call external APIs directly.
+
+Run the full ecosystem:
+```bash
+~/patroclus/scripts/start-ecosystem.sh start  # Starts all 6 services
+```
+
+See the [ecosystem documentation](https://github.com/rShetty/patroclus/blob/main/docs/ECOSYSTEM.md)
+for the complete integration guide.
+
 ## Status
 
 **Early development.**
