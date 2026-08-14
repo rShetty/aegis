@@ -81,7 +81,10 @@ mod tests {
     fn test_verify_hash_matches() {
         let engine = create_engine();
         let hash = "abc123def456";
-        engine.db.attestate_agent("agent-1", hash, Some(1234)).unwrap();
+        engine
+            .db
+            .attestate_agent("agent-1", hash, Some(1234))
+            .unwrap();
         let result = engine.verify_hash("agent-1", hash).unwrap();
         assert!(result);
     }
@@ -89,7 +92,10 @@ mod tests {
     #[test]
     fn test_verify_hash_mismatch() {
         let engine = create_engine();
-        engine.db.attestate_agent("agent-1", "correct-hash", Some(1234)).unwrap();
+        engine
+            .db
+            .attestate_agent("agent-1", "correct-hash", Some(1234))
+            .unwrap();
         let result = engine.verify_hash("agent-1", "wrong-hash").unwrap();
         assert!(!result);
     }

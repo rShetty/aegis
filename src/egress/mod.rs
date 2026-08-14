@@ -23,11 +23,17 @@ impl EgressEngine {
                 Some(action) if action == "allow" => return Ok(()),
                 Some(action) if action == "deny" => {
                     self.db.log_egress(
-                        Some(agent_id), "127.0.0.1", &dest_host, "CONNECT", "blocked",
-                        Some("Denied by egress policy"), None,
+                        Some(agent_id),
+                        "127.0.0.1",
+                        &dest_host,
+                        "CONNECT",
+                        "blocked",
+                        Some("Denied by egress policy"),
+                        None,
                     )?;
                     return Err(AegisError::EgressBlocked(format!(
-                        "Egress to {} denied by policy for agent {}", dest_host, agent_id
+                        "Egress to {} denied by policy for agent {}",
+                        dest_host, agent_id
                     )));
                 }
                 _ => {}
@@ -36,17 +42,28 @@ impl EgressEngine {
 
         if self.config.default_policy == "deny" {
             self.db.log_egress(
-                agent_id, "127.0.0.1", &dest_host, "CONNECT", "blocked",
-                Some("Default deny - no matching allow policy"), None,
+                agent_id,
+                "127.0.0.1",
+                &dest_host,
+                "CONNECT",
+                "blocked",
+                Some("Default deny - no matching allow policy"),
+                None,
             )?;
             return Err(AegisError::EgressBlocked(format!(
-                "Egress to {} denied (default deny)", dest_host
+                "Egress to {} denied (default deny)",
+                dest_host
             )));
         }
 
         self.db.log_egress(
-            agent_id, "127.0.0.1", &dest_host, "CONNECT", "allowed",
-            None, None,
+            agent_id,
+            "127.0.0.1",
+            &dest_host,
+            "CONNECT",
+            "allowed",
+            None,
+            None,
         )?;
         Ok(())
     }
@@ -87,7 +104,10 @@ mod tests {
     #[test]
     fn test_allow_policy_permits() {
         let engine = create_engine();
-        engine.db.add_egress_policy("agent-1", "api.github.com", "allow").unwrap();
+        engine
+            .db
+            .add_egress_policy("agent-1", "api.github.com", "allow")
+            .unwrap();
         let result = engine.check(Some("agent-1"), "https://api.github.com/repos");
         assert!(result.is_ok());
     }
@@ -95,7 +115,10 @@ mod tests {
     #[test]
     fn test_deny_policy_blocks() {
         let engine = create_engine();
-        engine.db.add_egress_policy("agent-1", "evil.example.com", "deny").unwrap();
+        engine
+            .db
+            .add_egress_policy("agent-1", "evil.example.com", "deny")
+            .unwrap();
         let result = engine.check(Some("agent-1"), "https://evil.example.com/api");
         assert!(result.is_err());
     }
@@ -103,15 +126,24 @@ mod tests {
     #[test]
     fn test_wildcard_policy() {
         let engine = create_engine();
-        engine.db.add_egress_policy("agent-1", "*.github.com", "allow").unwrap();
+        engine
+            .db
+            .add_egress_policy("agent-1", "*.github.com", "allow")
+            .unwrap();
         let result = engine.check(Some("agent-1"), "https://api.github.com/repos");
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_extract_host() {
-        assert_eq!(EgressEngine::extract_host("https://api.github.com/repos"), "api.github.com");
-        assert_eq!(EgressEngine::extract_host("http://localhost:8080/path"), "localhost");
+        assert_eq!(
+            EgressEngine::extract_host("https://api.github.com/repos"),
+            "api.github.com"
+        );
+        assert_eq!(
+            EgressEngine::extract_host("http://localhost:8080/path"),
+            "localhost"
+        );
         assert_eq!(EgressEngine::extract_host("evil.com/path"), "evil.com");
     }
 }

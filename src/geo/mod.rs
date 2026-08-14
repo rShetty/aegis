@@ -52,7 +52,9 @@ impl GeoEngine {
             "RU" => "RU".to_string(),
             "IR" => "IR".to_string(),
             "KP" => "KP".to_string(),
-            "EU" | "DE" | "FR" | "NL" | "IE" | "SE" | "PL" | "IT" | "ES" | "AT" | "BE" | "BG" | "HR" | "CY" | "CZ" | "DK" | "EE" | "FI" | "GR" | "HU" | "LV" | "LT" | "LU" | "MT" | "PT" | "RO" | "SK" | "SI" => "EU".to_string(),
+            "EU" | "DE" | "FR" | "NL" | "IE" | "SE" | "PL" | "IT" | "ES" | "AT" | "BE" | "BG"
+            | "HR" | "CY" | "CZ" | "DK" | "EE" | "FI" | "GR" | "HU" | "LV" | "LT" | "LU" | "MT"
+            | "PT" | "RO" | "SK" | "SI" => "EU".to_string(),
             "US" | "COM" | "NET" | "ORG" | "IO" => "US".to_string(),
             "UK" | "CO" => "UK".to_string(),
             _ => "UNKNOWN".to_string(),

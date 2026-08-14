@@ -38,4 +38,8 @@ impl IntoResponse for AegisError {
     }
 }
 
-use axum::{http::StatusCode, response::{IntoResponse, Response}, Json};
+use axum::{
+    Json,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};

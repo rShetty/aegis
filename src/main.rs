@@ -1,20 +1,17 @@
 use std::sync::Arc;
 
 use axum::{
+    Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     routing::{get, post},
-    Json, Router,
 };
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 use aegis::{
-    attestation::AttestationEngine,
-    config::Config,
-    db::Database,
-    egress::EgressEngine,
+    attestation::AttestationEngine, config::Config, db::Database, egress::EgressEngine,
     geo::GeoEngine,
 };
 
@@ -65,10 +62,18 @@ async fn main() -> anyhow::Result<()> {
             let config = Config::load(&config).unwrap_or_default();
             let db = Arc::new(Database::new(&config.database.path)?);
             let egress = Arc::new(EgressEngine::new(db.clone(), config.egress.clone()));
-            let attestation = Arc::new(AttestationEngine::new(db.clone(), config.attestation.enabled));
+            let attestation = Arc::new(AttestationEngine::new(
+                db.clone(),
+                config.attestation.enabled,
+            ));
             let geo = Arc::new(GeoEngine::new(&config.geo));
 
-            let state = AppState { db, egress, attestation, geo };
+            let state = AppState {
+                db,
+                egress,
+                attestation,
+                geo,
+            };
 
             let app = create_router(state);
             let addr = format!("{}:{}", config.server.host, config.server.port);
@@ -86,7 +91,10 @@ fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/egress/check", post(check_egress))
-        .route("/api/egress/policies/{agent_id}", get(list_policies).post(add_policy))
+        .route(
+            "/api/egress/policies/{agent_id}",
+            get(list_policies).post(add_policy),
+        )
         .route("/api/egress/log", get(egress_log))
         .route("/api/egress/stats", get(egress_stats))
         .route("/api/attestation/attestate", post(attestate_agent))
@@ -99,7 +107,10 @@ fn create_router(state: AppState) -> Router {
 }
 
 async fn health() -> (StatusCode, Json<serde_json::Value>) {
-    (StatusCode::OK, Json(serde_json::json!({"status": "ok", "service": "aegis"})))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status": "ok", "service": "aegis"})),
+    )
 }
 
 #[derive(Deserialize)]
@@ -112,7 +123,9 @@ async fn check_egress(
     State(state): State<AppState>,
     Json(req): Json<CheckEgressRequest>,
 ) -> Result<Json<serde_json::Value>, aegis::errors::AegisError> {
-    state.egress.check(req.agent_id.as_deref(), &req.destination)?;
+    state
+        .egress
+        .check(req.agent_id.as_deref(), &req.destination)?;
     state.geo.check_destination(&req.destination)?;
     Ok(Json(serde_json::json!({
         "allowed": true,
@@ -132,7 +145,9 @@ async fn list_policies(
             serde_json::json!({"destination": dest, "action": action, "created_at": created})
         })
         .collect();
-    Ok(Json(serde_json::json!({"agent_id": agent_id, "policies": result})))
+    Ok(Json(
+        serde_json::json!({"agent_id": agent_id, "policies": result}),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -146,8 +161,12 @@ async fn add_policy(
     Path(agent_id): Path<String>,
     Json(req): Json<AddPolicyRequest>,
 ) -> Result<Json<serde_json::Value>, aegis::errors::AegisError> {
-    state.db.add_egress_policy(&agent_id, &req.destination, &req.action)?;
-    Ok(Json(serde_json::json!({"added": true, "agent_id": agent_id, "destination": req.destination, "action": req.action})))
+    state
+        .db
+        .add_egress_policy(&agent_id, &req.destination, &req.action)?;
+    Ok(Json(
+        serde_json::json!({"added": true, "agent_id": agent_id, "destination": req.destination, "action": req.action}),
+    ))
 }
 
 async fn egress_log(
@@ -182,7 +201,9 @@ async fn attestate_agent(
     State(state): State<AppState>,
     Json(req): Json<AttestateRequest>,
 ) -> Result<Json<serde_json::Value>, aegis::errors::AegisError> {
-    let hash = state.attestation.attestate(&req.agent_id, &req.binary_path, req.pid)?;
+    let hash = state
+        .attestation
+        .attestate(&req.agent_id, &req.binary_path, req.pid)?;
     Ok(Json(serde_json::json!({
         "attested": true,
         "agent_id": req.agent_id,

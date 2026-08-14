@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use uuid::Uuid;
 
 use crate::errors::Result;
@@ -12,8 +12,9 @@ pub struct Database {
 
 impl Database {
     pub fn new(path: &str) -> Result<Self> {
-        let conn = Connection::open(path)
-            .map_err(|e| crate::errors::AegisError::Database(format!("failed to open database: {}", e)))?;
+        let conn = Connection::open(path).map_err(|e| {
+            crate::errors::AegisError::Database(format!("failed to open database: {}", e))
+        })?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         Self::run_migrations(&conn)?;
         Ok(Database {
@@ -62,7 +63,8 @@ impl Database {
                 count INTEGER NOT NULL DEFAULT 0,
                 window_start TEXT NOT NULL
             );
-        ")?;
+        ",
+        )?;
         Ok(())
     }
 
@@ -95,9 +97,8 @@ impl Database {
     pub fn check_egress(&self, agent_id: &str, destination: &str) -> Result<Option<String>> {
         let policies = {
             let _conn = self.conn.lock();
-            let mut stmt = _conn.prepare(
-                "SELECT destination, action FROM egress_policies WHERE agent_id = ?",
-            )?;
+            let mut stmt = _conn
+                .prepare("SELECT destination, action FROM egress_policies WHERE agent_id = ?")?;
             let rows = stmt.query_map(params![agent_id], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?;
@@ -119,17 +120,16 @@ impl Database {
         if pattern == "*" || pattern == destination {
             return true;
         }
-        if pattern.starts_with("*") {
-            let suffix = &pattern[1..];
+        if let Some(suffix) = pattern.strip_prefix("*") {
             return destination.ends_with(suffix);
         }
-        if pattern.ends_with("*") {
-            let prefix = &pattern[..pattern.len() - 1];
+        if let Some(prefix) = pattern.strip_suffix("*") {
             return destination.starts_with(prefix);
         }
         false
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn log_egress(
         &self,
         agent_id: Option<&str>,
@@ -179,7 +179,12 @@ impl Database {
         Ok(result)
     }
 
-    pub fn attestate_agent(&self, agent_id: &str, process_hash: &str, pid: Option<i64>) -> Result<()> {
+    pub fn attestate_agent(
+        &self,
+        agent_id: &str,
+        process_hash: &str,
+        pid: Option<i64>,
+    ) -> Result<()> {
         let conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
         conn.execute(
@@ -240,8 +245,16 @@ impl Database {
     pub fn egress_stats(&self) -> Result<serde_json::Value> {
         let conn = self.conn.lock();
         let total: i64 = conn.query_row("SELECT COUNT(*) FROM egress_log", [], |row| row.get(0))?;
-        let allowed: i64 = conn.query_row("SELECT COUNT(*) FROM egress_log WHERE status = 'allowed'", [], |row| row.get(0))?;
-        let blocked: i64 = conn.query_row("SELECT COUNT(*) FROM egress_log WHERE status = 'blocked'", [], |row| row.get(0))?;
+        let allowed: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM egress_log WHERE status = 'allowed'",
+            [],
+            |row| row.get(0),
+        )?;
+        let blocked: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM egress_log WHERE status = 'blocked'",
+            [],
+            |row| row.get(0),
+        )?;
         Ok(serde_json::json!({
             "total_requests": total,
             "allowed": allowed,
