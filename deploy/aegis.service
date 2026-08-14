@@ -1,0 +1,22 @@
+[Unit]
+Description=Aegis Egress Control & Attestation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aegis
+Group=aegis
+EnvironmentFile=/etc/aegis/aegis.env
+ExecStart=/usr/local/bin/aegis serve --config /etc/aegis/aegis.toml
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/aegis
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,180 @@
+name: Deploy Aegis
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aegis-production
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo check --workspace
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Scan tracked files for credentials
+        shell: bash
+        run: |
+          if git grep -n -I -E 'BEGIN (RSA|OPENSSH|EC) PRIVATE KEY' -- ':!.github/workflows/deploy.yml' ':!README.md'; then
+            exit 1
+          fi
+
+  security:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install security tooling
+        run: |
+          cargo install cargo-audit --locked
+          cargo install cargo-deny --locked
+      - name: Cargo audit
+        run: cargo audit
+      - name: Cargo deny
+        run: cargo deny check advisories bans licenses sources
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          exit-code: 1
+
+  deploy:
+    needs: [verify, security]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          timeout: 120s
+          command_timeout: 30m
+          script: |
+            set -euo pipefail
+
+            if [ ! -d /opt/aegis/.git ]; then
+              rm -rf /opt/aegis
+              git clone https://github.com/rShetty/Aegis.git /opt/aegis
+            fi
+
+            cd /opt/aegis
+            git fetch origin main
+            git reset --hard origin/main
+            git clean -fd
+
+            # Ensure config and env directories
+            mkdir -p /etc/aegis
+            if [ ! -f /etc/aegis/aegis.env ]; then
+              echo "RUST_LOG=info" > /etc/aegis/aegis.env
+            fi
+            chmod 600 /etc/aegis/aegis.env
+
+            # Copy config
+            cp config/aegis.toml /etc/aegis/aegis.toml
+
+            # Build
+            source "$HOME/.cargo/env"
+            cargo build --release
+
+            # Install binary
+            install -m 755 target/release/aegis /usr/local/bin/aegis
+
+            # Ensure user and data directory
+            id aegis >/dev/null 2>&1 || useradd --system --home-dir /var/lib/aegis --create-home --shell /usr/sbin/nologin aegis
+            mkdir -p /var/lib/aegis
+            chown aegis:aegis /var/lib/aegis
+
+            # Install systemd unit
+            cp deploy/aegis.service /etc/systemd/system/aegis.service
+            systemctl daemon-reload
+            systemctl enable aegis
+            systemctl restart aegis
+
+            # Health check with retries
+            sleep 5
+            for i in 1 2 3 4 5; do
+              if curl -sf http://127.0.0.1:8686/health; then
+                echo ""
+                echo "DEPLOY SUCCESS: aegis is healthy"
+                exit 0
+              fi
+              echo "Health check attempt $i failed, waiting..."
+              sleep 5
+            done
+
+            echo "ERROR: Health check failed"
+            journalctl -u aegis -n 30 --no-pager
+            exit 1
+
+      - name: Retry deploy (1)
+        if: failure()
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          timeout: 120s
+          command_timeout: 30m
+          script: |
+            set -euo pipefail
+            source "$HOME/.cargo/env"
+            cd /opt/aegis
+            git fetch origin main
+            git reset --hard origin/main
+            cargo build --release
+            install -m 755 target/release/aegis /usr/local/bin/aegis
+            cp config/aegis.toml /etc/aegis/aegis.toml
+            cp deploy/aegis.service /etc/systemd/system/aegis.service
+            systemctl daemon-reload
+            systemctl restart aegis
+            sleep 5
+            curl -sf http://127.0.0.1:8686/health && echo "DEPLOY SUCCESS (retry 1)" || (journalctl -u aegis -n 20 --no-pager && exit 1)
+
+      - name: Retry deploy (2)
+        if: failure()
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          timeout: 120s
+          command_timeout: 30m
+          script: |
+            set -euo pipefail
+            source "$HOME/.cargo/env"
+            cd /opt/aegis
+            systemctl restart aegis
+            sleep 5
+            curl -sf http://127.0.0.1:8686/health && echo "DEPLOY SUCCESS (retry 2)" || (journalctl -u aegis -n 20 --no-pager && exit 1)
