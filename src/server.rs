@@ -77,6 +77,18 @@ fn ct_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
     diff == 0
 }
 
+/// Run a blocking (SQLite / filesystem) operation on the dedicated blocking
+/// threadpool instead of a tokio worker (#5).
+pub(crate) async fn run_blocking<T, F>(f: F) -> Result<T, AegisError>
+where
+    F: FnOnce() -> Result<T, AegisError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| AegisError::Internal(format!("blocking task failed to complete: {e}")))?
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Database>,
@@ -200,10 +212,13 @@ async fn check_egress(
     State(state): State<AppState>,
     Json(req): Json<CheckEgressRequest>,
 ) -> Result<Json<serde_json::Value>, AegisError> {
-    state
-        .egress
-        .check(req.agent_id.as_deref(), &req.destination)?;
-    state.geo.check_destination(&req.destination)?;
+    let egress = state.egress.clone();
+    let agent_id = req.agent_id.clone();
+    let destination = req.destination.clone();
+    run_blocking(move || egress.check(agent_id.as_deref(), &destination)).await?;
+    let geo = state.geo.clone();
+    let destination = req.destination.clone();
+    run_blocking(move || geo.check_destination(&destination)).await?;
     Ok(Json(serde_json::json!({
         "allowed": true,
         "destination": req.destination,
@@ -215,7 +230,9 @@ async fn list_policies(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AegisError> {
-    let policies = state.db.get_egress_policies(&agent_id)?;
+    let db = state.db.clone();
+    let agent_for_db = agent_id.clone();
+    let policies = run_blocking(move || db.get_egress_policies(&agent_for_db)).await?;
     let result: Vec<serde_json::Value> = policies
         .into_iter()
         .map(|(id, dest, action, created)| {
@@ -251,9 +268,12 @@ async fn add_policy(
             crate::config::VALID_ACTIONS
         )));
     }
-    let id = state
-        .db
-        .add_egress_policy(&agent_id, &req.destination, &req.action)?;
+    let db = state.db.clone();
+    let agent_for_db = agent_id.clone();
+    let destination = req.destination.clone();
+    let action = req.action.clone();
+    let id =
+        run_blocking(move || db.add_egress_policy(&agent_for_db, &destination, &action)).await?;
     Ok(Json(
         serde_json::json!({"added": true, "id": id, "agent_id": agent_id, "destination": req.destination, "action": req.action}),
     ))
@@ -263,7 +283,12 @@ async fn remove_policy(
     State(state): State<AppState>,
     Path((agent_id, policy_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, AegisError> {
-    if state.db.remove_egress_policy(&agent_id, &policy_id)? {
+    let db = state.db.clone();
+    let agent_for_db = agent_id;
+    let policy_for_db = policy_id.clone();
+    let removed =
+        run_blocking(move || db.remove_egress_policy(&agent_for_db, &policy_for_db)).await?;
+    if removed {
         Ok(Json(serde_json::json!({"removed": true, "id": policy_id})))
     } else {
         Err(AegisError::PolicyNotFound(policy_id))
@@ -275,7 +300,8 @@ async fn egress_log(
     Query(params): Query<LogQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, AegisError> {
     let limit = params.limit.unwrap_or(100);
-    let log = state.db.list_egress_log(limit)?;
+    let db = state.db.clone();
+    let log = run_blocking(move || db.list_egress_log(limit)).await?;
     Ok(Json(log))
 }
 
@@ -287,7 +313,8 @@ struct LogQuery {
 async fn egress_stats(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, AegisError> {
-    let stats = state.db.egress_stats()?;
+    let db = state.db.clone();
+    let stats = run_blocking(move || db.egress_stats()).await?;
     Ok(Json(stats))
 }
 
@@ -302,9 +329,12 @@ async fn attestate_agent(
     State(state): State<AppState>,
     Json(req): Json<AttestateRequest>,
 ) -> Result<Json<serde_json::Value>, AegisError> {
-    let hash = state
-        .attestation
-        .attestate(&req.agent_id, &req.binary_path, req.pid)?;
+    let attestation = state.attestation.clone();
+    let agent_for_db = req.agent_id.clone();
+    let binary_path = req.binary_path.clone();
+    let pid = req.pid;
+    let hash =
+        run_blocking(move || attestation.attestate(&agent_for_db, &binary_path, pid)).await?;
     Ok(Json(serde_json::json!({
         "attested": true,
         "agent_id": req.agent_id,
@@ -323,13 +353,20 @@ async fn verify_agent(
     State(state): State<AppState>,
     Json(req): Json<VerifyRequest>,
 ) -> Result<Json<serde_json::Value>, AegisError> {
-    let verified = if let Some(path) = &req.binary_path {
-        state.attestation.verify(&req.agent_id, path)?
-    } else if let Some(hash) = &req.process_hash {
-        state.attestation.verify_hash(&req.agent_id, hash)?
-    } else {
-        false
-    };
+    let attestation = state.attestation.clone();
+    let agent_for_db = req.agent_id.clone();
+    let binary_path = req.binary_path.clone();
+    let process_hash = req.process_hash.clone();
+    let verified = run_blocking(move || {
+        if let Some(path) = &binary_path {
+            attestation.verify(&agent_for_db, path)
+        } else if let Some(hash) = &process_hash {
+            attestation.verify_hash(&agent_for_db, hash)
+        } else {
+            Ok(false)
+        }
+    })
+    .await?;
     Ok(Json(serde_json::json!({
         "agent_id": req.agent_id,
         "verified": verified,
@@ -339,7 +376,8 @@ async fn verify_agent(
 async fn list_attested(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<serde_json::Value>>, AegisError> {
-    let agents = state.db.list_attested_agents()?;
+    let db = state.db.clone();
+    let agents = run_blocking(move || db.list_attested_agents()).await?;
     Ok(Json(agents))
 }
 
@@ -352,7 +390,9 @@ async fn check_geo(
     State(state): State<AppState>,
     Json(req): Json<CheckGeoRequest>,
 ) -> Result<Json<serde_json::Value>, AegisError> {
-    state.geo.check_destination(&req.destination)?;
+    let geo = state.geo.clone();
+    let destination = req.destination.clone();
+    run_blocking(move || geo.check_destination(&destination)).await?;
     Ok(Json(serde_json::json!({
         "allowed": true,
         "destination": req.destination,
