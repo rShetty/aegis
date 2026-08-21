@@ -408,6 +408,24 @@ impl Database {
         Ok(result)
     }
 
+    /// Number of policy rows across all agents (#6).
+    ///
+    /// Backs the `aegis_active_policies` gauge, which queries SQLite at
+    /// scrape time so out-of-band policy changes are reflected immediately.
+    pub fn count_egress_policies(&self) -> Result<i64> {
+        let conn = self.conn.lock();
+        let count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM egress_policies", [], |row| row.get(0))?;
+        Ok(count)
+    }
+
+    /// Test-only: raw connection access for simulating database failures
+    /// (e.g. dropping a table) in readiness-probe tests (#6).
+    #[cfg(test)]
+    pub(crate) fn conn_for_test(&self) -> parking_lot::MutexGuard<'_, Connection> {
+        self.conn.lock()
+    }
+
     pub fn egress_stats(&self) -> Result<serde_json::Value> {
         let conn = self.conn.lock();
         let total: i64 = conn.query_row("SELECT COUNT(*) FROM egress_log", [], |row| row.get(0))?;

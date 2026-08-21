@@ -13,14 +13,14 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     Json, Router,
     extract::{ConnectInfo, Path, Query, Request, State},
     http::{HeaderName, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
 use chrono::Utc;
@@ -30,7 +30,8 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 use crate::{
     attestation::AttestationEngine, config::Config, db::Database, egress::EgressEngine,
-    egress::RequestContext, errors::AegisError, geo::GeoEngine, net::TrustedProxies,
+    egress::RequestContext, errors::AegisError, geo::GeoEngine, metrics::Metrics,
+    net::TrustedProxies,
 };
 
 /// Paths under /api that belong to the agent data plane and do NOT require
@@ -111,6 +112,8 @@ pub struct AppState {
     /// Allowlist of proxies permitted to set `X-Forwarded-For` (#7). Empty:
     /// XFF is never honored, source_ip is always the direct peer.
     pub trusted_proxies: Arc<TrustedProxies>,
+    /// Prometheus instrumentation (#6), scraped via `GET /metrics`.
+    pub metrics: Arc<Metrics>,
 }
 
 /// Bookkeeping for `egress_log` retention (#10): the configured window plus
@@ -141,6 +144,10 @@ impl RetentionState {
 
 impl AppState {
     pub fn new(db: Arc<Database>, config: &Config, admin_token: Option<AdminToken>) -> Self {
+        let metrics = Arc::new(
+            Metrics::new(db.clone())
+                .expect("static Prometheus metric descriptors are valid and freshly constructed"),
+        );
         let egress = Arc::new(EgressEngine::new(
             db.clone(),
             config.egress.clone(),
@@ -160,6 +167,7 @@ impl AppState {
             cors_allowed_origins: Arc::new(config.server.cors_allowed_origins.clone()),
             retention: Arc::new(RetentionState::new(config.egress.log_retention_days)),
             trusted_proxies: Arc::new(TrustedProxies::from_config(&config.server.trusted_proxies)),
+            metrics,
         }
     }
 }
@@ -299,6 +307,9 @@ pub fn build_router(state: AppState) -> Result<Router, AegisError> {
     let cors = build_cors(&state.cors_allowed_origins)?;
     Ok(Router::new()
         .route("/health", get(health))
+        .route("/health/live", get(health_live))
+        .route("/health/ready", get(health_ready))
+        .route("/metrics", get(metrics))
         .route("/api/egress/check", post(check_egress))
         .route(
             "/api/egress/policies/{agent_id}",
@@ -324,12 +335,72 @@ pub fn build_router(state: AppState) -> Result<Router, AegisError> {
         .with_state(state))
 }
 
+/// Liveness probe (#6).
+///
+/// Deliberately dependency-free: the process is alive iff it can serve HTTP.
+/// A wedged database must flip readiness, not liveness — restarting a
+/// healthy-but-busy instance fixes nothing and loses in-flight work.
 async fn health() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::OK,
         Json(serde_json::json!({"status": "ok", "service": "aegis"})),
     )
 }
+
+/// Alias of [`health`] for orchestrators expecting `/health/live` (#6). The
+/// response body is intentionally identical so dashboards can treat them as
+/// one series.
+async fn health_live() -> (StatusCode, Json<serde_json::Value>) {
+    health().await
+}
+
+/// Readiness probe with a real database round-trip (#6): a `SELECT COUNT(*)
+/// FROM egress_policies` is executed on the blocking pool, exactly as real
+/// traffic would. 200 only when the query succeeds; any failure maps to 503
+/// so load balancers drain the instance instead of routing to it.
+///
+/// The count itself is discarded — this endpoint proves *reachability*, not
+/// data volume.
+async fn health_ready(State(state): State<AppState>) -> Response {
+    let db = state.db.clone();
+    match run_blocking(move || db.count_egress_policies()).await {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ready",
+                "service": "aegis",
+                "checks": {"database": "ok"},
+            })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "readiness probe: database check failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "unavailable",
+                    "service": "aegis",
+                    "checks": {"database": "error"},
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Prometheus scrape endpoint (#6), public like the probes: cardinality is
+/// bounded (three families, no per-agent labels) and it leaks no policy or
+/// agent identity.
+async fn metrics(State(state): State<AppState>) -> Response {
+    let mut response = (StatusCode::OK, state.metrics.render()).into_response();
+    if let Ok(value) = HeaderValue::from_str(PROMETHEUS_CONTENT_TYPE) {
+        response.headers_mut().insert(header::CONTENT_TYPE, value);
+    }
+    response
+}
+
+/// `Content-Type` of the Prometheus text exposition format, version 0.0.4.
+const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4";
 
 #[derive(serde::Deserialize)]
 struct CheckEgressRequest {
@@ -341,16 +412,33 @@ async fn check_egress(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<Json<serde_json::Value>, AegisError> {
+    // Wall-clock latency for the metrics histogram (#6): starts before any
+    // work, so validation failures are timed too.
+    let started = Instant::now();
+
     // Capture true request metadata (#7) BEFORE the body is consumed:
     // trusted-proxy-aware client IP, actual HTTP method, header provenance.
     let peer = peer_of(&request);
     let meta = RequestMeta::capture(&request, peer, &state.trusted_proxies);
 
     let size_cap = state.egress.config.max_request_size_bytes;
-    let bytes = to_bytes_limited(request.into_body(), size_cap).await?;
+    let bytes = match to_bytes_limited(request.into_body(), size_cap).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            // Timed but not a verdict (#6): the request never reached
+            // enforcement, so no decision counter moves.
+            state.metrics.observe_latency("/api/egress/check", started);
+            return Err(e);
+        }
+    };
     let size_bytes = Some(bytes.len() as i64);
-    let req: CheckEgressRequest = serde_json::from_slice(&bytes)
-        .map_err(|e| AegisError::BadRequest(format!("invalid JSON body: {e}")))?;
+    let req: CheckEgressRequest = match serde_json::from_slice(&bytes) {
+        Ok(req) => req,
+        Err(e) => {
+            state.metrics.observe_latency("/api/egress/check", started);
+            return Err(AegisError::BadRequest(format!("invalid JSON body: {e}")));
+        }
+    };
 
     let CheckEgressRequest {
         agent_id,
@@ -363,22 +451,55 @@ async fn check_egress(
     // Geo residency check FIRST (#12 F2): it is part of the verdict. Running
     // it after EgressEngine::check used to persist an "allowed" audit row
     // for requests that were then rejected by the geo gate.
+    //
+    // Every terminal outcome is metered (#6): `blocked` for geo and policy
+    // rejections, `error` for infrastructure failures, `allowed` otherwise.
     let geo = state.geo.clone();
     let destination_for_geo = destination.clone();
-    run_blocking(move || geo.check_destination(&destination_for_geo)).await?;
+    if let Err(err) = run_blocking(move || geo.check_destination(&destination_for_geo)).await {
+        state.metrics.observe_decision(
+            "/api/egress/check",
+            if err.is_infrastructure_failure() {
+                "error"
+            } else {
+                "blocked"
+            },
+            started,
+        );
+        return Err(err);
+    }
 
     let egress = state.egress.clone();
     let agent_for_check = agent_id.clone();
     let destination_for_check = destination.clone();
-    run_blocking(move || {
+    match run_blocking(move || {
         egress.check_with_ctx(agent_for_check.as_deref(), &destination_for_check, &ctx)
     })
-    .await?;
-    Ok(Json(serde_json::json!({
-        "allowed": true,
-        "destination": destination,
-        "agent_id": agent_id,
-    })))
+    .await
+    {
+        Ok(()) => {
+            state
+                .metrics
+                .observe_decision("/api/egress/check", "allowed", started);
+            Ok(Json(serde_json::json!({
+                "allowed": true,
+                "destination": destination,
+                "agent_id": agent_id,
+            })))
+        }
+        Err(err) => {
+            state.metrics.observe_decision(
+                "/api/egress/check",
+                if err.is_infrastructure_failure() {
+                    "error"
+                } else {
+                    "blocked"
+                },
+                started,
+            );
+            Err(err)
+        }
+    }
 }
 
 /// Read a request body into memory with a hard cap so a hostile client cannot
@@ -582,6 +703,10 @@ async fn check_geo(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<Json<serde_json::Value>, AegisError> {
+    // Latency starts before the body is read (#6): validation failures are
+    // timed like every other terminal outcome.
+    let started = Instant::now();
+
     // True request metadata for the audit rows (#7).
     let peer = peer_of(&request);
     let meta = RequestMeta::capture(&request, peer, &state.trusted_proxies);
@@ -597,7 +722,9 @@ async fn check_geo(
 
     // Audit the geo verdict (#12 F7): this endpoint previously returned
     // allow/deny with no egress_log row at all, leaving data-residency
-    // enforcement invisible to operators. Both outcomes are recorded.
+    // enforcement invisible to operators. Both outcomes are recorded — and
+    // both are metered (#6), with `error` reserved for infrastructure
+    // failures so a database outage never inflates "blocked".
     let geo = state.geo.clone();
     let destination_for_geo = destination.clone();
     let outcome = run_blocking(move || geo.check_destination(&destination_for_geo)).await;
@@ -620,6 +747,9 @@ async fn check_geo(
                 )
             })
             .await?;
+            state
+                .metrics
+                .observe_decision("/api/geo/check", "allowed", started);
             Ok(Json(serde_json::json!({
                 "allowed": true,
                 "destination": destination,
@@ -643,6 +773,15 @@ async fn check_geo(
                 )
             })
             .await?;
+            state.metrics.observe_decision(
+                "/api/geo/check",
+                if err.is_infrastructure_failure() {
+                    "error"
+                } else {
+                    "blocked"
+                },
+                started,
+            );
             Err(err)
         }
     }
@@ -1112,5 +1251,296 @@ mod tests {
         .unwrap();
         assert_eq!(resp.status(), 400);
         assert_eq!(state.db.list_egress_log(10).unwrap().len(), 0);
+    }
+
+    // ---------------- health probes and Prometheus metrics (#6) ----------------
+
+    use axum::body::HttpBody;
+
+    /// `GET` a path against the router and return `(status, headers, body)`.
+    async fn get_full(state: AppState, path: &str) -> (StatusCode, header::HeaderValue, String) {
+        let app = build_router(state).unwrap();
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            axum::http::Request::builder()
+                .method("GET")
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .cloned()
+            .expect("every response under test carries a content type");
+        let size = usize::try_from(resp.body().size_hint().exact().unwrap_or(64 * 1024))
+            .unwrap_or(64 * 1024)
+            .max(1024);
+        let body = axum::body::to_bytes(resp.into_body(), size).await.unwrap();
+        (
+            status,
+            content_type,
+            String::from_utf8(body.to_vec()).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn liveness_is_dependency_free_and_readiness_probes_the_database() {
+        // Both probes answer 200 on a healthy instance...
+        let (_tmp, state) = test_state(vec![]);
+
+        let (status, _, body) = get_full(state.clone(), "/health/live").await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["service"], "aegis");
+
+        let (status, _, body) = get_full(state.clone(), "/health/ready").await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["status"], "ready");
+        assert_eq!(json["checks"]["database"], "ok");
+
+        // ...and /health stays a valid alias with an identical body.
+        let (status, _, _) = get_full(state.clone(), "/health").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readiness_fails_closed_with_503_when_database_is_unreachable() {
+        let (_tmp, state) = test_state(vec![]);
+        // Simulate a broken/corrupt database: the table the probe checks is
+        // gone, so every readiness round-trip fails until an operator
+        // intervenes.
+        {
+            let conn = state.db.conn_for_test();
+            conn.execute_batch("DROP TABLE egress_policies;").unwrap();
+        }
+
+        let (status, _, body) = get_full(state, "/health/ready").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["status"], "unavailable");
+        assert_eq!(json["checks"]["database"], "error");
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_serves_text_exposition_format() {
+        let (_tmp, state) = test_state(vec![]);
+        state.db.add_egress_policy("agent-1", "*", "allow").unwrap();
+
+        // One allowed decision so the counter is non-zero in this scrape.
+        let app = build_router(state.clone()).unwrap();
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            post_check(
+                "/api/egress/check",
+                r#"{"agent_id":"agent-1","destination":"https://api.github.com"}"#,
+                &[],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let (status, content_type, body) = get_full(state, "/metrics").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            content_type, "text/plain; version=0.0.4",
+            "standard Prometheus text exposition content type"
+        );
+        assert!(
+            !body.contains("agent-1"),
+            "no per-agent data may leak through metrics: {body}"
+        );
+
+        for family in [
+            "# TYPE aegis_egress_decisions_total counter",
+            "# TYPE aegis_egress_check_latency_seconds histogram",
+            "# TYPE aegis_active_policies gauge",
+        ] {
+            assert!(body.contains(family), "missing `{family}` in:\n{body}");
+        }
+        assert!(
+            body.contains("aegis_egress_decisions_total{outcome=\"allowed\"} 1"),
+            "the allowed decision was metered: {body}"
+        );
+        assert!(
+            body.contains("aegis_active_policies 1"),
+            "gauge counts the one seeded policy: {body}"
+        );
+        assert!(
+            body.contains(
+                "aegis_egress_check_latency_seconds_count{route=\"/api/egress/check\"} 1"
+            ),
+            "latency observed exactly once: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_verdicts_increment_outcome_blocked_not_error() {
+        let (_tmp, state) = test_state(vec!["CN".to_string()]);
+
+        // Geo-blocked decision endpoint call.
+        let client_addr: SocketAddr = "203.0.113.7:55000".parse().unwrap();
+        let app = router_with_peer(state.clone(), client_addr);
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            post_check(
+                "/api/geo/check",
+                r#"{"destination":"https://evil.cn/x"}"#,
+                &[],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 403);
+
+        // Policy-denied egress check.
+        let app = build_router(state.clone()).unwrap();
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            post_check(
+                "/api/egress/check",
+                r#"{"agent_id":"agent-9","destination":"https://api.github.com"}"#,
+                &[],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 403);
+
+        let (_, _, body) = get_full(state, "/metrics").await;
+        assert!(
+            body.contains("aegis_egress_decisions_total{outcome=\"blocked\"} 2"),
+            "both denials are policy verdicts: {body}"
+        );
+        assert!(
+            !body.contains("outcome=\"error\""),
+            "infrastructure outcome stays at zero (series absent): {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_requests_are_metered_but_never_audited_as_verdicts() {
+        let (_tmp, state) = test_state(vec![]);
+        let client_addr: SocketAddr = "203.0.113.8:56000".parse().unwrap();
+        let app = router_with_peer(state.clone(), client_addr);
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            post_check("/api/egress/check", "{\"destination\": ", &[]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 400);
+
+        // The request was timed (#6: validation failures are latency data)
+        // but no decision counter moved: it never reached enforcement.
+        let (_, _, body) = get_full(state.clone(), "/metrics").await;
+        assert!(
+            body.contains(
+                "aegis_egress_check_latency_seconds_count{route=\"/api/egress/check\"} 1"
+            ),
+            "validation failure still contributes a latency observation: {body}"
+        );
+        assert!(
+            !body.contains("aegis_egress_decisions_total{"),
+            "no verdict series exists yet (families stay registered but unobserved): {body}"
+        );
+        assert_eq!(
+            state.db.list_egress_log(10).unwrap().len(),
+            0,
+            "malformed input must not become audit evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn decisions_counter_tracks_every_audit_row_one_to_one() {
+        let (_tmp, state) = test_state(vec!["CN".to_string()]);
+        state.db.add_egress_policy("agent-1", "*", "allow").unwrap();
+
+        // Two allowed checks + one geo-blocked check on the same engine.
+        for dest in [
+            "https://api.github.com/a",
+            "https://api.github.com/b",
+            "https://blocked.cn/c",
+        ] {
+            let app = build_router(state.clone()).unwrap();
+            let resp = tower::ServiceExt::oneshot(
+                app,
+                post_check(
+                    "/api/egress/check",
+                    &format!(r#"{{"agent_id":"agent-1","destination":"{dest}"}}"#),
+                    &[],
+                ),
+            )
+            .await
+            .unwrap();
+            let expected = if dest.ends_with("/c") { 403 } else { 200 };
+            assert_eq!(resp.status(), expected);
+        }
+
+        // Audit parity: summed over outcomes, the counter covers every
+        // audited verdict exactly once. (Geo rejections on this endpoint are
+        // deliberately NOT audited, per #12 F2, so the invariant is
+        // `total_requests == allowed + blocked - geo_rejections`; here one
+        // geo rejection occurred.)
+        let stats = state.db.egress_stats().unwrap();
+        let (_, _, body) = get_full(state, "/metrics").await;
+
+        let parse = |name: &str| -> u64 {
+            body.lines()
+                .find_map(|l| l.strip_prefix(name)?.trim().parse::<u64>().ok())
+                .unwrap_or_else(|| panic!("{name} not found in scrape:\n{body}"))
+        };
+        let allowed = parse("aegis_egress_decisions_total{outcome=\"allowed\"}");
+        let blocked = parse("aegis_egress_decisions_total{outcome=\"blocked\"}");
+        assert_eq!(
+            stats["total_requests"].as_u64().unwrap(),
+            allowed + blocked - 1,
+            "audited rows = metered verdicts minus unaudited geo rejections"
+        );
+        assert_eq!(allowed, 2);
+        assert_eq!(
+            blocked, 1,
+            "geo rejection is metered even though it is not audited (#12 F2)"
+        );
+    }
+
+    #[tokio::test]
+    async fn gauge_reflects_policy_crud_between_scrapes() {
+        let (_tmp, state) = test_state(vec![]);
+
+        let (_, _, body) = get_full(state.clone(), "/metrics").await;
+        assert!(body.contains("aegis_active_policies 0"));
+
+        let id = state
+            .db
+            .add_egress_policy("agent-1", "api.github.com", "allow")
+            .unwrap();
+        let (_, _, body) = get_full(state.clone(), "/metrics").await;
+        assert!(body.contains("aegis_active_policies 1"), "{body}");
+
+        assert!(state.db.remove_egress_policy("agent-1", &id).unwrap());
+        let (_, _, body) = get_full(state, "/metrics").await;
+        assert!(body.contains("aegis_active_policies 0"), "{body}");
+    }
+
+    #[test]
+    fn infrastructure_failures_are_classified_separately_from_denials() {
+        use crate::errors::AegisError;
+        // Infrastructure: database/config/internal.
+        assert!(AegisError::Database("x".into()).is_infrastructure_failure());
+        assert!(AegisError::Config("x".into()).is_infrastructure_failure());
+        assert!(AegisError::Internal("x".into()).is_infrastructure_failure());
+        // Policy verdicts and caller errors are not.
+        assert!(!AegisError::EgressBlocked("x".into()).is_infrastructure_failure());
+        assert!(!AegisError::BadRequest("x".into()).is_infrastructure_failure());
+        assert!(!AegisError::Unauthorized("x".into()).is_infrastructure_failure());
+        assert!(!AegisError::PolicyNotFound("x".into()).is_infrastructure_failure());
+        assert!(!AegisError::AttestationFailed("x".into()).is_infrastructure_failure());
     }
 }

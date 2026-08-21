@@ -29,6 +29,26 @@ pub enum AegisError {
 
 pub type Result<T> = std::result::Result<T, AegisError>;
 
+impl AegisError {
+    /// Whether this failure is an infrastructure fault (database/config/
+    /// internal) rather than a policy verdict (#6).
+    ///
+    /// Metrics and alerts must not conflate the two: a database outage is
+    /// `aegis_egress_decisions_total{outcome="error"}`, while "the agent
+    /// asked for something it may not have" stays `{outcome="blocked"}`.
+    /// Everything else in this enum — including [`AegisError::EgressBlocked`]
+    /// (policy/attestation/residency denials), [`AegisError::BadRequest`]
+    /// (malformed request), [`AegisError::Unauthorized`], and
+    /// [`AegisError::PolicyNotFound`] — is the control plane working as
+    /// designed.
+    pub fn is_infrastructure_failure(&self) -> bool {
+        matches!(
+            self,
+            AegisError::Database(_) | AegisError::Config(_) | AegisError::Internal(_)
+        )
+    }
+}
+
 impl From<rusqlite::Error> for AegisError {
     fn from(e: rusqlite::Error) -> Self {
         AegisError::Database(e.to_string())

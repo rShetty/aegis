@@ -136,7 +136,10 @@ export AEGIS_ADMIN_TOKEN="$(openssl rand -hex 32)"
 
 | Endpoint | Auth | Purpose |
 |---|---|---|
-| `GET /health` | none | liveness |
+| `GET /health` | none | liveness (process up; no dependencies checked) |
+| `GET /health/live` | none | liveness probe alias (#6) |
+| `GET /health/ready` | none | readiness — 200 only after a live DB round-trip, 503 otherwise (#6) |
+| `GET /metrics` | none | Prometheus scrape: decision counter by outcome, decision latency histogram, active-policies gauge (#6) |
 | `POST /api/egress/check` | none* | egress verdict (data plane) |
 | `POST /api/geo/check` | none* | coarse residency verdict |
 | `POST /api/attestation/verify` | none* | hash equality check |
@@ -159,6 +162,15 @@ request-body size. Rows also carry the raw XFF chain and user agent for
 provenance. Databases created by older builds migrate in place on startup
 (versioned via `PRAGMA user_version`; historical rows keep their original
 values).
+
+Metrics (#6): `GET /metrics` serves three bounded-cardinality families in
+Prometheus text format — `aegis_egress_decisions_total{outcome}` (verdicts of
+`/api/egress/check` and `/api/geo/check`, with `outcome` one of `allowed`,
+`blocked` for policy denials, or `error` for infrastructure faults),
+`aegis_egress_check_latency_seconds{route}` (wall-clock decision latency,
+including requests that fail validation), and `aegis_active_policies` (policy
+rows, counted in SQLite at scrape time). No per-agent or per-destination
+labels are ever exported.
 
 Minimal config (`config.toml`):
 

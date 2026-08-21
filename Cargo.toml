@@ -28,6 +28,9 @@ toml = "0.8"
 sha2 = "0.10"
 hex = "0.4"
 regex = "1"
+# Prometheus client (text exposition only; protobuf feature pulls a heavy
+# codegen chain this project does not need).
+prometheus = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }
