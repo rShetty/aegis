@@ -1,6 +1,8 @@
 [server]
-host = "0.0.0.0"
+host = "127.0.0.1"
 port = 8686
+# Exact origins allowed to call the API from a browser. Empty = no CORS.
+cors_allowed_origins = []
 
 [database]
 path = "/var/lib/aegis/aegis.db"

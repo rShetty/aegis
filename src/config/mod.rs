@@ -13,6 +13,10 @@ pub struct Config {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Explicit CORS allowlist (exact origins, e.g. "https://admin.example.com").
+    /// Empty list = cross-origin browser access is denied entirely (#1).
+    #[serde(default)]
+    pub cors_allowed_origins: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,8 +48,11 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             server: ServerConfig {
-                host: "0.0.0.0".to_string(),
+                // Loopback by default (#1): an egress control plane must not
+                // silently expose admin APIs on all interfaces.
+                host: "127.0.0.1".to_string(),
                 port: 8686,
+                cors_allowed_origins: vec![],
             },
             database: DatabaseConfig {
                 path: "aegis.db".to_string(),

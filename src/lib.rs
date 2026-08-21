@@ -7,3 +7,4 @@ pub mod egress;
 pub mod errors;
 pub mod geo;
 pub mod policy;
+pub mod server;

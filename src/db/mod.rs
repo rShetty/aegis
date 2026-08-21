@@ -68,7 +68,12 @@ impl Database {
         Ok(())
     }
 
-    pub fn add_egress_policy(&self, agent_id: &str, destination: &str, action: &str) -> Result<()> {
+    pub fn add_egress_policy(
+        &self,
+        agent_id: &str,
+        destination: &str,
+        action: &str,
+    ) -> Result<String> {
         let conn = self.conn.lock();
         let id = Uuid::now_v7().to_string();
         let now = Utc::now().to_rfc3339();
@@ -76,16 +81,31 @@ impl Database {
             "INSERT INTO egress_policies (id, agent_id, destination, action, created_at) VALUES (?, ?, ?, ?, ?)",
             params![id, agent_id, destination, action, now],
         )?;
-        Ok(())
+        Ok(id)
     }
 
-    pub fn get_egress_policies(&self, agent_id: &str) -> Result<Vec<(String, String, String)>> {
+    /// Remove a specific policy by id, scoped to the agent. Returns whether
+    /// a row was deleted.
+    pub fn remove_egress_policy(&self, agent_id: &str, policy_id: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let deleted = conn.execute(
+            "DELETE FROM egress_policies WHERE id = ? AND agent_id = ?",
+            params![policy_id, agent_id],
+        )?;
+        Ok(deleted > 0)
+    }
+
+    /// List policies for an agent as `(id, destination, action, created_at)`.
+    pub fn get_egress_policies(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<(String, String, String, String)>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT destination, action, created_at FROM egress_policies WHERE agent_id = ? ORDER BY created_at DESC",
+            "SELECT id, destination, action, created_at FROM egress_policies WHERE agent_id = ? ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![agent_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?;
         let mut result = Vec::new();
         for row in rows {
