@@ -94,6 +94,12 @@ impl Database {
         Ok(result)
     }
 
+    /// Look up the effective policy action for a destination.
+    ///
+    /// Deny rules are evaluated before allow rules (#2): if any policy
+    /// pattern matches and says "deny", the result is denied even when a
+    /// broader allow (e.g. `*.github.com`) also matches. Returns
+    /// `Some("deny")`, `Some("allow")`, or `None` when no policy matches.
     pub fn check_egress(&self, agent_id: &str, destination: &str) -> Result<Option<String>> {
         let policies = {
             let _conn = self.conn.lock();
@@ -108,25 +114,23 @@ impl Database {
             }
             result
         };
+
+        let mut allow = false;
+        // Deny wins over allow regardless of insertion order.
         for (dest, action) in &policies {
-            if Self::match_destination(dest, destination) {
-                return Ok(Some(action.clone()));
+            if crate::destination::matches(dest, destination) {
+                if action == "deny" {
+                    return Ok(Some(action.clone()));
+                }
+                if action == "allow" {
+                    allow = true;
+                }
             }
         }
+        if allow {
+            return Ok(Some("allow".to_string()));
+        }
         Ok(None)
-    }
-
-    fn match_destination(pattern: &str, destination: &str) -> bool {
-        if pattern == "*" || pattern == destination {
-            return true;
-        }
-        if let Some(suffix) = pattern.strip_prefix("*") {
-            return destination.ends_with(suffix);
-        }
-        if let Some(prefix) = pattern.strip_suffix("*") {
-            return destination.starts_with(prefix);
-        }
-        false
     }
 
     #[allow(clippy::too_many_arguments)]
