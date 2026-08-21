@@ -91,7 +91,11 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(db: Arc<Database>, config: &Config, admin_token: Option<AdminToken>) -> Self {
-        let egress = Arc::new(EgressEngine::new(db.clone(), config.egress.clone()));
+        let egress = Arc::new(EgressEngine::new(
+            db.clone(),
+            config.egress.clone(),
+            config.attestation.require_attestation,
+        ));
         let attestation = Arc::new(AttestationEngine::new(
             db.clone(),
             config.attestation.enabled,

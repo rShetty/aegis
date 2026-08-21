@@ -7,15 +7,48 @@ use crate::errors::{AegisError, Result};
 pub struct EgressEngine {
     db: Arc<Database>,
     config: EgressConfig,
+    /// When true (#4), egress is denied for any agent that has not been
+    /// attested (registered via /api/attestation/attestate).
+    require_attestation: bool,
 }
 
 impl EgressEngine {
-    pub fn new(db: Arc<Database>, config: EgressConfig) -> Self {
-        EgressEngine { db, config }
+    pub fn new(db: Arc<Database>, config: EgressConfig, require_attestation: bool) -> Self {
+        EgressEngine {
+            db,
+            config,
+            require_attestation,
+        }
     }
 
     pub fn check(&self, agent_id: Option<&str>, destination: &str) -> Result<()> {
         let dest_host = Self::extract_host(destination);
+
+        // Attestation gate (#4): when require_attestation is set, only
+        // agents present in the attestation store may make egress requests.
+        // Requests without an agent identity cannot be attested and are
+        // denied fail-closed.
+        if self.require_attestation {
+            let attested = match agent_id {
+                Some(id) => self.db.is_attested(id)?,
+                None => false,
+            };
+            if !attested {
+                self.db.log_egress(
+                    agent_id,
+                    "127.0.0.1",
+                    &dest_host,
+                    "CONNECT",
+                    "blocked",
+                    Some("Attestation required: agent is not attested"),
+                    None,
+                )?;
+                return Err(AegisError::EgressBlocked(format!(
+                    "Egress to {} denied: attestation required and agent is not attested",
+                    dest_host
+                )));
+            }
+        }
 
         if let Some(agent_id) = agent_id {
             let policy = self.db.check_egress(agent_id, &dest_host)?;
@@ -78,6 +111,10 @@ mod tests {
     use super::*;
 
     fn create_engine() -> EgressEngine {
+        create_engine_with_attestation(false)
+    }
+
+    fn create_engine_with_attestation(require_attestation: bool) -> EgressEngine {
         let db = Arc::new(Database::new(":memory:").unwrap());
         let config = EgressConfig {
             default_policy: "deny".to_string(),
@@ -85,7 +122,7 @@ mod tests {
             max_connections_per_agent: 10,
             bandwidth_limit_kbps: 1024,
         };
-        EgressEngine::new(db, config)
+        EgressEngine::new(db, config, require_attestation)
     }
 
     #[test]
@@ -329,5 +366,70 @@ mod tests {
                 .check(Some("agent-1"), "https://bücher.example.com")
                 .is_err()
         );
+    }
+
+    // ---------------- attestation enforcement (#4) ----------------
+
+    #[test]
+    fn attestation_enforced_blocks_unattested_agent() {
+        let engine = create_engine_with_attestation(true);
+        // Even an explicit allow policy must not bypass the attestation gate.
+        add(&engine, "agent-1", "api.github.com", "allow");
+        assert!(
+            engine
+                .check(Some("agent-1"), "https://api.github.com")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn attestation_enforced_allows_attested_agent() {
+        let engine = create_engine_with_attestation(true);
+        add(&engine, "agent-1", "api.github.com", "allow");
+        engine
+            .db
+            .attestate_agent("agent-1", "some-hash", Some(42))
+            .unwrap();
+        assert!(
+            engine
+                .check(Some("agent-1"), "https://api.github.com")
+                .is_ok()
+        );
+        // A different (unattested) agent is still blocked.
+        assert!(
+            engine
+                .check(Some("agent-2"), "https://api.github.com")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn attestation_enforced_denies_missing_agent_id() {
+        let engine = create_engine_with_attestation(true);
+        // No agent identity -> cannot be attested -> fail closed.
+        assert!(engine.check(None, "https://api.github.com").is_err());
+    }
+
+    #[test]
+    fn attestation_unenforced_ignores_attestation_store() {
+        let engine = create_engine_with_attestation(false);
+        add(&engine, "agent-1", "api.github.com", "allow");
+        // Not attested, but require_attestation=false: policy decides alone.
+        assert!(
+            engine
+                .check(Some("agent-1"), "https://api.github.com")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn attestation_blocked_attempts_are_logged() {
+        let engine = create_engine_with_attestation(true);
+        let _ = engine.check(Some("ghost-agent"), "https://api.github.com");
+        let log = engine.db.list_egress_log(10).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0]["status"], "blocked");
+        assert_eq!(log[0]["agent_id"], "ghost-agent");
+        assert!(log[0]["reason"].as_str().unwrap().contains("not attested"));
     }
 }

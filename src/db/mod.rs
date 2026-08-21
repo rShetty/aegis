@@ -84,6 +84,17 @@ impl Database {
         Ok(id)
     }
 
+    /// Whether an agent has been attested (has a row in attested_agents).
+    pub fn is_attested(&self, agent_id: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM attested_agents WHERE agent_id = ?",
+            params![agent_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Remove a specific policy by id, scoped to the agent. Returns whether
     /// a row was deleted.
     pub fn remove_egress_policy(&self, agent_id: &str, policy_id: &str) -> Result<bool> {
