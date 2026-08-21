@@ -59,7 +59,9 @@ async fn main() -> anyhow::Result<()> {
             println!("Created config.toml");
         }
         Commands::Serve { config } => {
-            let config = Config::load(&config).unwrap_or_default();
+            // Fail fast on missing/invalid configuration (#3): never fall back
+            // to defaults for a security control.
+            let config = Config::load(&config)?;
             let db = Arc::new(Database::new(&config.database.path)?);
             let egress = Arc::new(EgressEngine::new(db.clone(), config.egress.clone()));
             let attestation = Arc::new(AttestationEngine::new(
@@ -161,6 +163,14 @@ async fn add_policy(
     Path(agent_id): Path<String>,
     Json(req): Json<AddPolicyRequest>,
 ) -> Result<Json<serde_json::Value>, aegis::errors::AegisError> {
+    // Strict action validation (#3): reject anything but allow/deny with 400.
+    if !aegis::config::is_valid_action(&req.action) {
+        return Err(aegis::errors::AegisError::BadRequest(format!(
+            "invalid action '{}': must be one of {:?}",
+            req.action,
+            aegis::config::VALID_ACTIONS
+        )));
+    }
     state
         .db
         .add_egress_policy(&agent_id, &req.destination, &req.action)?;

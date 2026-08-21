@@ -16,6 +16,15 @@ pub enum AegisError {
 
     #[error("configuration error: {0}")]
     Config(String),
+
+    #[error("bad request: {0}")]
+    BadRequest(String),
+
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
+
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 
 pub type Result<T> = std::result::Result<T, AegisError>;
@@ -32,6 +41,8 @@ impl IntoResponse for AegisError {
             AegisError::EgressBlocked(_) => (StatusCode::FORBIDDEN, self.to_string()),
             AegisError::AttestationFailed(_) => (StatusCode::UNAUTHORIZED, self.to_string()),
             AegisError::PolicyNotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
+            AegisError::BadRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            AegisError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, self.to_string()),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
         };
         (status, Json(serde_json::json!({ "error": message }))).into_response()
