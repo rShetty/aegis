@@ -152,12 +152,22 @@ export AEGIS_ADMIN_TOKEN="$(openssl rand -hex 32)"
 layer (loopback/firewall) and treat reachability as authorization. See the
 threat model.
 
+Audit fidelity (#7): every `egress_log` row records the request's true
+metadata — the client IP (direct socket peer; `X-Forwarded-For` is honored
+only from `[server] trusted_proxies`), the actual HTTP method, and the buffered
+request-body size. Rows also carry the raw XFF chain and user agent for
+provenance. Databases created by older builds migrate in place on startup
+(versioned via `PRAGMA user_version`; historical rows keep their original
+values).
+
 Minimal config (`config.toml`):
 
 ```toml
 [server]
 host = "127.0.0.1"
 port = 8686
+# Proxies trusted to set X-Forwarded-For (#7). Empty = XFF never honored.
+trusted_proxies = []
 
 [database]
 path = "/var/lib/aegis/aegis.db"

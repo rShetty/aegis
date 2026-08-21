@@ -15,10 +15,12 @@ fn seed_old(state: &aegis::server::AppState, agent: &str, destination: &str, age
         .db
         .log_egress_at(
             Some(agent),
-            "127.0.0.1",
+            "192.0.2.10",
             destination,
-            "CONNECT",
+            "POST",
             "allowed",
+            None,
+            None,
             None,
             None,
             &ts,

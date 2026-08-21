@@ -17,6 +17,7 @@ pub fn test_config(db_path: &str) -> Config {
             host: "127.0.0.1".into(),
             port: 0,
             cors_allowed_origins: vec![],
+            trusted_proxies: vec![],
         },
         database: DatabaseConfig {
             path: db_path.to_string(),

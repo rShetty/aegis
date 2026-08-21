@@ -4,9 +4,55 @@ use crate::config::EgressConfig;
 use crate::db::Database;
 use crate::errors::{AegisError, Result};
 
+/// Per-request metadata recorded verbatim in `egress_log` (#7).
+///
+/// The HTTP layer fills this from the actual request (trusted-proxy-aware
+/// client IP, HTTP method, body size); the engine never invents placeholder
+/// values anymore.
+#[derive(Debug, Clone, Default)]
+pub struct RequestContext {
+    /// True client IP resolved with `crate::net::resolve_client_ip`.
+    pub source_ip: String,
+    /// Actual HTTP method of the check call (GET/POST/...).
+    pub method: String,
+    /// Request-body size in bytes, when the body was buffered.
+    pub size_bytes: Option<i64>,
+    /// Raw `X-Forwarded-For` as presented, for audit provenance.
+    pub forwarded_for: Option<String>,
+    /// `User-Agent` of the checking harness.
+    pub user_agent: Option<String>,
+}
+
+impl RequestContext {
+    pub fn new(source_ip: impl Into<String>, method: impl Into<String>) -> Self {
+        RequestContext {
+            source_ip: source_ip.into(),
+            method: method.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_size(mut self, size_bytes: Option<i64>) -> Self {
+        self.size_bytes = size_bytes;
+        self
+    }
+
+    pub fn with_provenance(
+        mut self,
+        forwarded_for: Option<String>,
+        user_agent: Option<String>,
+    ) -> Self {
+        self.forwarded_for = forwarded_for;
+        self.user_agent = user_agent;
+        self
+    }
+}
+
 pub struct EgressEngine {
     db: Arc<Database>,
-    config: EgressConfig,
+    /// Public read-only access for the HTTP layer (#7): the body-size cap
+    /// doubles as the buffered-read limit when capturing request metadata.
+    pub config: EgressConfig,
     /// When true (#4), egress is denied for any agent that has not been
     /// attested (registered via /api/attestation/attestate).
     require_attestation: bool,
@@ -21,7 +67,47 @@ impl EgressEngine {
         }
     }
 
+    /// Write one audit row carrying exactly the request's true metadata (#7):
+    /// resolved client IP, HTTP method, body size, and header provenance.
+    fn audit(
+        &self,
+        agent_id: Option<&str>,
+        destination: &str,
+        status: &str,
+        reason: Option<&str>,
+        ctx: &RequestContext,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.db.log_egress_at(
+            agent_id,
+            &ctx.source_ip,
+            destination,
+            &ctx.method,
+            status,
+            reason,
+            ctx.size_bytes,
+            ctx.forwarded_for.as_deref(),
+            ctx.user_agent.as_deref(),
+            &now,
+        )
+    }
+
+    /// Legacy entry point kept for callers without an HTTP context (tests,
+    /// CLI tooling). Logs loopback metadata rather than pretending to know
+    /// the client.
     pub fn check(&self, agent_id: Option<&str>, destination: &str) -> Result<()> {
+        let ctx = RequestContext::new("127.0.0.1", "POST");
+        self.check_with_ctx(agent_id, destination, &ctx)
+    }
+
+    /// Full check with true request metadata (#7): every verdict is audited
+    /// against the values the caller actually sent.
+    pub fn check_with_ctx(
+        &self,
+        agent_id: Option<&str>,
+        destination: &str,
+        ctx: &RequestContext,
+    ) -> Result<()> {
         let dest_host = Self::extract_host(destination);
 
         // Attestation gate (#4): when require_attestation is set, only
@@ -34,14 +120,12 @@ impl EgressEngine {
                 None => false,
             };
             if !attested {
-                self.db.log_egress(
+                self.audit(
                     agent_id,
-                    "127.0.0.1",
                     &dest_host,
-                    "CONNECT",
                     "blocked",
                     Some("Attestation required: agent is not attested"),
-                    None,
+                    ctx,
                 )?;
                 return Err(AegisError::EgressBlocked(format!(
                     "Egress to {} denied: attestation required and agent is not attested",
@@ -59,26 +143,16 @@ impl EgressEngine {
                     // egress_log. The bare early-return silently skipped the
                     // audit row for exactly the traffic an operator most
                     // needs evidence of.
-                    self.db.log_egress(
-                        Some(agent_id),
-                        "127.0.0.1",
-                        &dest_host,
-                        "CONNECT",
-                        "allowed",
-                        None,
-                        None,
-                    )?;
+                    self.audit(Some(agent_id), &dest_host, "allowed", None, ctx)?;
                     return Ok(());
                 }
                 Some(action) if action == "deny" => {
-                    self.db.log_egress(
+                    self.audit(
                         Some(agent_id),
-                        "127.0.0.1",
                         &dest_host,
-                        "CONNECT",
                         "blocked",
                         Some("Denied by egress policy"),
-                        None,
+                        ctx,
                     )?;
                     return Err(AegisError::EgressBlocked(format!(
                         "Egress to {} denied by policy for agent {}",
@@ -90,14 +164,12 @@ impl EgressEngine {
         }
 
         if self.config.default_policy == "deny" {
-            self.db.log_egress(
+            self.audit(
                 agent_id,
-                "127.0.0.1",
                 &dest_host,
-                "CONNECT",
                 "blocked",
                 Some("Default deny - no matching allow policy"),
-                None,
+                ctx,
             )?;
             return Err(AegisError::EgressBlocked(format!(
                 "Egress to {} denied (default deny)",
@@ -105,15 +177,7 @@ impl EgressEngine {
             )));
         }
 
-        self.db.log_egress(
-            agent_id,
-            "127.0.0.1",
-            &dest_host,
-            "CONNECT",
-            "allowed",
-            None,
-            None,
-        )?;
+        self.audit(agent_id, &dest_host, "allowed", None, ctx)?;
         Ok(())
     }
 
@@ -232,6 +296,71 @@ mod tests {
             "localhost"
         );
         assert_eq!(EgressEngine::extract_host("evil.com/path"), "evil.com");
+    }
+
+    // ---------------- true request metadata is what gets logged (#7) ----------------
+
+    #[test]
+    fn allowed_verdict_logs_real_request_values() {
+        let engine = create_engine();
+        engine
+            .db
+            .add_egress_policy("agent-1", "api.github.com", "allow")
+            .unwrap();
+        let ctx = RequestContext::new("198.51.100.10", "PUT")
+            .with_size(Some(4096))
+            .with_provenance(
+                Some("198.51.100.10, 10.0.0.2".into()),
+                Some("harness/9".into()),
+            );
+        engine
+            .check_with_ctx(Some("agent-1"), "https://api.github.com/repos", &ctx)
+            .unwrap();
+
+        let log = engine.db.list_egress_log(10).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0]["source_ip"], "198.51.100.10", "true client IP");
+        assert_eq!(log[0]["method"], "PUT", "actual HTTP method");
+        assert_eq!(log[0]["size_bytes"], 4096, "request body size");
+        assert_eq!(log[0]["forwarded_for"], "198.51.100.10, 10.0.0.2");
+        assert_eq!(log[0]["user_agent"], "harness/9");
+    }
+
+    #[test]
+    fn blocked_verdicts_log_real_request_values() {
+        let engine = create_engine();
+        // Default deny blocks this; every blocked path must carry the real
+        // values too.
+        let ctx = RequestContext::new("203.0.113.99", "DELETE").with_size(Some(17));
+        assert!(
+            engine
+                .check_with_ctx(Some("agent-1"), "https://evil.example.com/api", &ctx)
+                .is_err()
+        );
+        let log = engine.db.list_egress_log(10).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0]["status"], "blocked");
+        assert_eq!(log[0]["source_ip"], "203.0.113.99");
+        assert_eq!(log[0]["method"], "DELETE");
+        assert_eq!(log[0]["size_bytes"], 17);
+    }
+
+    #[test]
+    fn missing_body_size_is_logged_as_null_not_zero() {
+        let engine = create_engine();
+        engine
+            .db
+            .add_egress_policy("agent-1", "*", "allow")
+            .unwrap();
+        // No size known (e.g. body not buffered): honest NULL beats a lie.
+        let ctx = RequestContext::new("192.0.2.8", "GET");
+        engine
+            .check_with_ctx(Some("agent-1"), "https://api.github.com", &ctx)
+            .unwrap();
+        let log = engine.db.list_egress_log(10).unwrap();
+        assert_eq!(log[0]["size_bytes"], serde_json::Value::Null);
+        assert_eq!(log[0]["source_ip"], "192.0.2.8");
+        assert_eq!(log[0]["method"], "GET");
     }
 
     // ---------------- adversarial suite (#2) ----------------

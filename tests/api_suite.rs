@@ -426,14 +426,16 @@ async fn check_request_validation_rejects_bad_payloads() {
         .unwrap();
     assert_eq!(resp.status(), 400);
 
-    // Well-formed JSON failing deserialization (destination missing) -> 422.
+    // Well-formed JSON failing deserialization (destination missing) -> 400.
+    // (#7: bodies are buffered by the handler now, so deserialization errors
+    // surface as our own BadRequest instead of axum's extractor 422.)
     let resp = client
         .post(format!("{base}/api/egress/check"))
         .json(&serde_json::json!({"agent_id": "agent-1"}))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 422);
+    assert_eq!(resp.status(), 400);
 
     tx.send(()).unwrap();
     handle.await.unwrap();

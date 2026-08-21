@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, Request, State},
-    http::{HeaderValue, Method, StatusCode, header},
+    extract::{ConnectInfo, Path, Query, Request, State},
+    http::{HeaderName, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::Response,
     routing::{delete, get, post},
@@ -30,7 +30,7 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 use crate::{
     attestation::AttestationEngine, config::Config, db::Database, egress::EgressEngine,
-    errors::AegisError, geo::GeoEngine,
+    egress::RequestContext, errors::AegisError, geo::GeoEngine, net::TrustedProxies,
 };
 
 /// Paths under /api that belong to the agent data plane and do NOT require
@@ -40,6 +40,9 @@ const DATA_PLANE_PATHS: [&str; 3] = [
     "/api/geo/check",
     "/api/attestation/verify",
 ];
+
+/// `X-Forwarded-For` has no constant in `http::header` (#7).
+const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 
 fn is_admin_path(path: &str) -> bool {
     path.starts_with("/api/") && !DATA_PLANE_PATHS.contains(&path)
@@ -105,6 +108,9 @@ pub struct AppState {
     pub cors_allowed_origins: Arc<Vec<String>>,
     /// Shared counters for egress_log retention pruning (#10).
     pub retention: Arc<RetentionState>,
+    /// Allowlist of proxies permitted to set `X-Forwarded-For` (#7). Empty:
+    /// XFF is never honored, source_ip is always the direct peer.
+    pub trusted_proxies: Arc<TrustedProxies>,
 }
 
 /// Bookkeeping for `egress_log` retention (#10): the configured window plus
@@ -153,8 +159,59 @@ impl AppState {
             admin_token,
             cors_allowed_origins: Arc::new(config.server.cors_allowed_origins.clone()),
             retention: Arc::new(RetentionState::new(config.egress.log_retention_days)),
+            trusted_proxies: Arc::new(TrustedProxies::from_config(&config.server.trusted_proxies)),
         }
     }
+}
+
+/// True per-request metadata captured before the body is consumed (#7).
+struct RequestMeta {
+    source_ip: String,
+    method: String,
+    forwarded_for: Option<String>,
+    user_agent: Option<String>,
+}
+
+impl RequestMeta {
+    /// Capture from the incoming request. The socket peer is authoritative;
+    /// `X-Forwarded-For` counts only when the peer is a configured trusted
+    /// proxy. Failures fall back to the peer, never to a placeholder constant.
+    fn capture(req: &Request, peer: std::net::SocketAddr, trusted: &TrustedProxies) -> Self {
+        let forwarded_for = req
+            .headers()
+            .get(&X_FORWARDED_FOR)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        RequestMeta {
+            source_ip: crate::net::resolve_client_ip(peer.ip(), forwarded_for.as_deref(), trusted),
+            method: req.method().to_string(),
+            forwarded_for,
+            user_agent: req
+                .headers()
+                .get(header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string()),
+        }
+    }
+}
+
+/// The direct socket peer of a request, or loopback when absent.
+///
+/// Production requests carry `ConnectInfo` (via
+/// `into_make_service_with_connect_info`); unit-test `oneshot` calls carry
+/// `MockConnectInfo` instead. Both name the same truth: the socket peer.
+fn peer_of(req: &Request) -> std::net::SocketAddr {
+    use axum::extract::connect_info::MockConnectInfo;
+    if let Some(ConnectInfo(addr)) = req.extensions().get::<ConnectInfo<std::net::SocketAddr>>() {
+        return *addr;
+    }
+    if let Some(MockConnectInfo(addr)) = req
+        .extensions()
+        .get::<MockConnectInfo<std::net::SocketAddr>>()
+    {
+        return *addr;
+    }
+    "127.0.0.1:0".parse().expect("static SocketAddr")
 }
 
 /// Prune expired `egress_log` rows once, updating the shared retention
@@ -282,12 +339,27 @@ struct CheckEgressRequest {
 
 async fn check_egress(
     State(state): State<AppState>,
-    Json(req): Json<CheckEgressRequest>,
+    request: Request,
 ) -> Result<Json<serde_json::Value>, AegisError> {
+    // Capture true request metadata (#7) BEFORE the body is consumed:
+    // trusted-proxy-aware client IP, actual HTTP method, header provenance.
+    let peer = peer_of(&request);
+    let meta = RequestMeta::capture(&request, peer, &state.trusted_proxies);
+
+    let size_cap = state.egress.config.max_request_size_bytes;
+    let bytes = to_bytes_limited(request.into_body(), size_cap).await?;
+    let size_bytes = Some(bytes.len() as i64);
+    let req: CheckEgressRequest = serde_json::from_slice(&bytes)
+        .map_err(|e| AegisError::BadRequest(format!("invalid JSON body: {e}")))?;
+
     let CheckEgressRequest {
         agent_id,
         destination,
     } = req;
+    let ctx = RequestContext::new(meta.source_ip, meta.method)
+        .with_size(size_bytes)
+        .with_provenance(meta.forwarded_for, meta.user_agent);
+
     // Geo residency check FIRST (#12 F2): it is part of the verdict. Running
     // it after EgressEngine::check used to persist an "allowed" audit row
     // for requests that were then rejected by the geo gate.
@@ -298,12 +370,26 @@ async fn check_egress(
     let egress = state.egress.clone();
     let agent_for_check = agent_id.clone();
     let destination_for_check = destination.clone();
-    run_blocking(move || egress.check(agent_for_check.as_deref(), &destination_for_check)).await?;
+    run_blocking(move || {
+        egress.check_with_ctx(agent_for_check.as_deref(), &destination_for_check, &ctx)
+    })
+    .await?;
     Ok(Json(serde_json::json!({
         "allowed": true,
         "destination": destination,
         "agent_id": agent_id,
     })))
+}
+
+/// Read a request body into memory with a hard cap so a hostile client cannot
+/// balloon allocations before the size is even known.
+async fn to_bytes_limited(
+    body: axum::body::Body,
+    max: usize,
+) -> Result<axum::body::Bytes, AegisError> {
+    axum::body::to_bytes(body, max)
+        .await
+        .map_err(|e| AegisError::BadRequest(format!("failed to read request body: {e}")))
 }
 
 async fn list_policies(
@@ -494,9 +580,21 @@ struct CheckGeoRequest {
 
 async fn check_geo(
     State(state): State<AppState>,
-    Json(req): Json<CheckGeoRequest>,
+    request: Request,
 ) -> Result<Json<serde_json::Value>, AegisError> {
+    // True request metadata for the audit rows (#7).
+    let peer = peer_of(&request);
+    let meta = RequestMeta::capture(&request, peer, &state.trusted_proxies);
+
+    let size_cap = state.egress.config.max_request_size_bytes;
+    let bytes = to_bytes_limited(request.into_body(), size_cap).await?;
+    let size_bytes = Some(bytes.len() as i64);
+    let req: CheckGeoRequest = serde_json::from_slice(&bytes)
+        .map_err(|e| AegisError::BadRequest(format!("invalid JSON body: {e}")))?;
     let CheckGeoRequest { destination } = req;
+    // RFC3339 "now" captured once so both verdict branches stamp identically.
+    let now = Utc::now().to_rfc3339();
+
     // Audit the geo verdict (#12 F7): this endpoint previously returned
     // allow/deny with no egress_log row at all, leaving data-residency
     // enforcement invisible to operators. Both outcomes are recorded.
@@ -508,14 +606,17 @@ async fn check_geo(
         Ok(()) => {
             let destination_for_log = destination.clone();
             run_blocking(move || {
-                db.log_egress(
+                db.log_egress_at(
                     None,
-                    "127.0.0.1",
+                    &meta.source_ip,
                     &destination_for_log,
-                    "CONNECT",
+                    &meta.method,
                     "allowed",
                     None,
-                    None,
+                    size_bytes,
+                    meta.forwarded_for.as_deref(),
+                    meta.user_agent.as_deref(),
+                    &now,
                 )
             })
             .await?;
@@ -528,14 +629,17 @@ async fn check_geo(
             let reason = err.to_string();
             let destination_for_log = destination.clone();
             run_blocking(move || {
-                db.log_egress(
+                db.log_egress_at(
                     None,
-                    "127.0.0.1",
+                    &meta.source_ip,
                     &destination_for_log,
-                    "CONNECT",
+                    &meta.method,
                     "blocked",
                     Some(&reason),
-                    None,
+                    size_bytes,
+                    meta.forwarded_for.as_deref(),
+                    meta.user_agent.as_deref(),
+                    &now,
                 )
             })
             .await?;
@@ -601,6 +705,7 @@ mod tests {
                 host: "127.0.0.1".into(),
                 port: 0,
                 cors_allowed_origins: vec![],
+                trusted_proxies: vec![],
             },
             database: crate::config::DatabaseConfig {
                 path: tmp.path().join("unused.db").to_string_lossy().to_string(),
@@ -752,7 +857,7 @@ mod tests {
                     Some("agent-1"),
                     "127.0.0.1",
                     &format!("host-{i}.example.com"),
-                    "CONNECT",
+                    "GET",
                     "allowed",
                     None,
                     None,
@@ -795,5 +900,217 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resp.status(), 200);
+    }
+
+    // ---------------- true request metadata end-to-end (#7) ----------------
+
+    use axum::extract::connect_info::MockConnectInfo;
+    use std::net::SocketAddr;
+
+    /// A router with a mocked peer address so `oneshot` requests carry
+    /// ConnectInfo exactly as the real socket path would.
+    fn router_with_peer(state: AppState, peer: SocketAddr) -> axum::Router {
+        build_router(state).unwrap().layer(MockConnectInfo(peer))
+    }
+
+    fn post_check(
+        uri: &str,
+        body: &str,
+        headers: &[(&str, &str)],
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut builder = axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json");
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        builder
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn check_logs_true_method_size_and_untrusted_peer_ip() {
+        let (_tmp, state) = test_state(vec![]);
+        state.db.add_egress_policy("agent-1", "*", "allow").unwrap();
+
+        // Peer is a random non-loopback client: no trusted proxy configured,
+        // so its XFF must be ignored and the peer itself recorded.
+        let client_addr: SocketAddr = "203.0.113.5:52344".parse().unwrap();
+        let app = router_with_peer(state.clone(), client_addr);
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            post_check(
+                "/api/egress/check",
+                r#"{"agent_id":"agent-1","destination":"https://api.github.com/repos"}"#,
+                &[("user-agent", "aegis-itest/1")],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let log = state.db.list_egress_log(10).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0]["source_ip"], "203.0.113.5", "direct peer recorded");
+        assert_eq!(
+            log[0]["method"], "POST",
+            "actual HTTP method of the check call"
+        );
+        // The buffered body length is what gets recorded (the JSON payload of
+        // this very request), not a constant.
+        let expected_size = log[0]["size_bytes"].as_i64().unwrap();
+        assert!(
+            expected_size > 0,
+            "body size must be the real buffered length, got {expected_size}"
+        );
+    }
+
+    #[tokio::test]
+    async fn untrusted_caller_cannot_forge_source_ip_via_xff() {
+        let (_tmp, state) = test_state(vec![]);
+        state.db.add_egress_policy("agent-1", "*", "allow").unwrap();
+
+        let client_addr: SocketAddr = "198.51.100.1:40000".parse().unwrap();
+        let app = router_with_peer(state.clone(), client_addr);
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            post_check(
+                "/api/egress/check",
+                r#"{"agent_id":"agent-1","destination":"https://api.github.com"}"#,
+                &[("x-forwarded-for", "9.9.9.9")],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let log = state.db.list_egress_log(10).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(
+            log[0]["source_ip"], "198.51.100.1",
+            "XFF from an untrusted peer must be ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_proxy_xff_is_honored_and_audited() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::new(":memory:").unwrap());
+        let config = crate::config::Config {
+            server: crate::config::ServerConfig {
+                host: "127.0.0.1".into(),
+                port: 0,
+                cors_allowed_origins: vec![],
+                // Loopback LB is trusted to set XFF.
+                trusted_proxies: vec!["127.0.0.1".to_string()],
+            },
+            database: crate::config::DatabaseConfig {
+                path: tmp.path().join("unused.db").to_string_lossy().to_string(),
+            },
+            egress: crate::config::EgressConfig {
+                default_policy: "deny".into(),
+                max_request_size_bytes: 1 << 20,
+                max_connections_per_agent: 10,
+                bandwidth_limit_kbps: 1024,
+                log_retention_days: 30,
+            },
+            attestation: crate::config::AttestationConfig {
+                enabled: true,
+                require_attestation: false,
+            },
+            geo: crate::config::GeoConfig {
+                enabled: false,
+                blocked_regions: vec![],
+            },
+        };
+        let state = AppState::new(db, &config, None);
+        state.db.add_egress_policy("agent-1", "*", "allow").unwrap();
+
+        let proxy_addr: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let app = router_with_peer(state.clone(), proxy_addr);
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            post_check(
+                "/api/egress/check",
+                r#"{"agent_id":"agent-1","destination":"https://api.github.com"}"#,
+                &[("x-forwarded-for", "198.51.100.77")],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let log = state.db.list_egress_log(10).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(
+            log[0]["source_ip"], "198.51.100.77",
+            "trusted proxy may speak for the client"
+        );
+        assert_eq!(
+            log[0]["forwarded_for"], "198.51.100.77",
+            "raw header kept as provenance"
+        );
+    }
+
+    #[tokio::test]
+    async fn geo_endpoint_logs_real_metadata_too() {
+        let (_tmp, state) = test_state(vec!["CN".to_string()]);
+
+        let client_addr: SocketAddr = "203.0.113.66:51000".parse().unwrap();
+        let app = router_with_peer(state.clone(), client_addr);
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            post_check(
+                "/api/geo/check",
+                r#"{"destination":"https://evil.cn/data"}"#,
+                &[],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 403);
+
+        let log = state.db.list_egress_log(10).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0]["status"], "blocked");
+        assert_eq!(log[0]["source_ip"], "203.0.113.66");
+        assert_eq!(log[0]["method"], "POST");
+    }
+
+    #[tokio::test]
+    async fn oversized_body_is_rejected_not_truncated() {
+        let (_tmp, state) = test_state(vec![]);
+        let client_addr: SocketAddr = "203.0.113.5:53000".parse().unwrap();
+        let app = router_with_peer(state.clone(), client_addr);
+
+        // 2 MiB body vs the 1 MiB test cap.
+        let huge = format!(
+            "{{\"agent_id\":\"a\",\"destination\":\"{}\"}}",
+            "x".repeat(2 * 1024 * 1024)
+        );
+        let resp = tower::ServiceExt::oneshot(app, post_check("/api/egress/check", &huge, &[]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "over-cap body rejected cleanly");
+
+        // Nothing was audited (no verdict was reached).
+        assert_eq!(state.db.list_egress_log(10).unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn malformed_json_body_maps_to_400_with_metadata_path() {
+        let (_tmp, state) = test_state(vec![]);
+        let client_addr: SocketAddr = "203.0.113.5:54000".parse().unwrap();
+        let app = router_with_peer(state.clone(), client_addr);
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            post_check("/api/egress/check", "{\"destination\": ", &[]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 400);
+        assert_eq!(state.db.list_egress_log(10).unwrap().len(), 0);
     }
 }

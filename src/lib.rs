@@ -6,5 +6,6 @@ pub mod destination;
 pub mod egress;
 pub mod errors;
 pub mod geo;
+pub mod net;
 pub mod policy;
 pub mod server;

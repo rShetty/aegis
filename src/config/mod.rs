@@ -17,6 +17,12 @@ pub struct ServerConfig {
     /// Empty list = cross-origin browser access is denied entirely (#1).
     #[serde(default)]
     pub cors_allowed_origins: Vec<String>,
+    /// Proxies allowed to set `X-Forwarded-For` on behalf of clients (#7).
+    /// Entries are exact IPs (`10.0.0.9`) or CIDR ranges (`10.0.0.0/8`,
+    /// `fd00::/8`). Empty = XFF is never honored and the direct socket peer is
+    /// always recorded as source_ip.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +68,7 @@ impl Default for Config {
                 host: "127.0.0.1".to_string(),
                 port: 8686,
                 cors_allowed_origins: vec![],
+                trusted_proxies: vec![],
             },
             database: DatabaseConfig {
                 path: "aegis.db".to_string(),
@@ -133,6 +140,13 @@ impl Config {
             return Err(anyhow::anyhow!(
                 "egress.log_retention_days must be at least 1 (audit rows are pruned, never kept forever by default; set a larger value to retain longer)"
             ));
+        }
+        for entry in &self.server.trusted_proxies {
+            if crate::net::TrustedProxy::parse(entry).is_none() {
+                return Err(anyhow::anyhow!(
+                    "server.trusted_proxies entry '{entry}' is not a valid IP or CIDR (e.g. 10.0.0.9 or 10.0.0.0/8)"
+                ));
+            }
         }
         Ok(())
     }
@@ -250,6 +264,33 @@ port = 8686
         let mut no_db = config.clone();
         no_db.database.path = "  ".into();
         assert!(no_db.validate().is_err());
+    }
+
+    #[test]
+    fn test_trusted_proxies_validated_and_defaulted() {
+        // Omitted field keeps parsing (backwards compatible config files).
+        let path = write_temp_config(&valid_toml());
+        let config = Config::load(&path).expect("config without trusted_proxies must load");
+        assert!(config.server.trusted_proxies.is_empty());
+
+        // A valid entry parses.
+        let toml = valid_toml().replace(
+            "port = 8686\n",
+            "port = 8686\ntrusted_proxies = [\"10.0.0.0/8\", \"fd00::/8\"]\n",
+        );
+        let path = write_temp_config(&toml);
+        let config = Config::load(&path).expect("valid trusted_proxies must load");
+        assert_eq!(config.server.trusted_proxies.len(), 2);
+
+        // An invalid entry fails fast (#3) — never silently ignored.
+        let toml = valid_toml().replace(
+            "port = 8686\n",
+            "port = 8686\ntrusted_proxies = [\"not-a-proxy\"]\n",
+        );
+        let path = write_temp_config(&toml);
+        let err = Config::load(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("trusted_proxies"), "got: {msg}");
     }
 
     #[test]
