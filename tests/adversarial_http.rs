@@ -134,12 +134,8 @@ async fn adversarial_destinations_over_http() {
         );
     }
 
-    // The audit trail recorded every blocked attempt. NOTE (#8 audit
-    // observation): checks allowed by an explicit policy currently return
-    // early from EgressEngine::check WITHOUT an audit row — 2 of these 19
-    // cases were allowed, so 17 rows appear. The README promises "every
-    // check (allowed or blocked)" is logged; this gap is tracked as a
-    // finding of the #12 deep-audit pass.
+    // The audit trail records EVERY attempt (#12 F1): allowed-by-policy
+    // checks are audited too, not just blocked ones. 19 cases -> 19 rows.
     let resp = client
         .get(format!("{base}/api/egress/log?limit=100"))
         .header(&auth.0, &auth.1)
@@ -149,9 +145,10 @@ async fn adversarial_destinations_over_http() {
     assert_eq!(resp.status(), 200);
     let rows: serde_json::Value = resp.json().await.unwrap();
     let rows = rows.as_array().unwrap();
-    let blocked = cases().iter().filter(|c| c.2).count();
-    assert_eq!(rows.len(), blocked);
-    assert!(rows.iter().all(|r| r["status"] == "blocked"));
+    assert_eq!(rows.len(), cases().len());
+    let expected_blocked = cases().iter().filter(|c| c.2).count();
+    let actual_blocked = rows.iter().filter(|r| r["status"] == "blocked").count();
+    assert_eq!(actual_blocked, expected_blocked);
 
     tx.send(()).unwrap();
     handle.await.unwrap();

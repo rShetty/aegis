@@ -2,9 +2,25 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use rusqlite::{Connection, params};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::errors::Result;
+
+/// Constant-time string comparison (#12 F4).
+///
+/// Compares SHA-256 digests instead of raw bytes so the comparison time does
+/// not depend on the position of the first mismatch. Length differences are
+/// also masked by hashing both sides to fixed 32-byte values.
+fn ct_eq_str(a: &str, b: &str) -> bool {
+    let da = Sha256::digest(a.as_bytes());
+    let db = Sha256::digest(b.as_bytes());
+    let mut diff = 0u8;
+    for (x, y) in da.iter().zip(db.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
 
 pub struct Database {
     conn: Arc<parking_lot::Mutex<Connection>>,
@@ -290,7 +306,15 @@ impl Database {
             .ok();
         match stored_hash {
             Some(h) => {
-                let match_result = h == process_hash;
+                // Constant-time comparison (#12 F4): this runs behind the
+                // unauthenticated data-plane endpoint /api/attestation/verify,
+                // so a short-circuiting `==` lets a local attacker recover
+                // the registered process hash one byte at a time via
+                // response-timing analysis — and with it, impersonate an
+                // attested agent. Comparing SHA-256 digests makes the
+                // comparison time independent of how many leading bytes
+                // matched.
+                let match_result = ct_eq_str(&h, process_hash);
                 if match_result {
                     let now = Utc::now().to_rfc3339();
                     conn.execute(
@@ -439,5 +463,27 @@ mod tests {
         .unwrap();
         let rows = db.list_egress_log(10).unwrap();
         assert_eq!(rows[0]["timestamp"], serde_json::json!(ts));
+    }
+
+    // ---------------- timing-safe hash verification (#12 F4) ----------------
+
+    #[test]
+    fn verify_agent_accepts_exact_hash_and_rejects_wrong_and_partial() {
+        let db = mem_db();
+        db.attestate_agent("agent-1", "deadbeef", Some(1)).unwrap();
+        assert!(db.verify_agent("agent-1", "deadbeef").unwrap());
+        assert!(!db.verify_agent("agent-1", "deadbeee").unwrap());
+        assert!(!db.verify_agent("agent-1", "").unwrap());
+        assert!(!db.verify_agent("agent-1", "deadbeef00").unwrap());
+    }
+
+    #[test]
+    fn ct_eq_str_is_exact_match_only() {
+        assert!(ct_eq_str("abc", "abc"));
+        assert!(!ct_eq_str("abc", "abd"));
+        assert!(!ct_eq_str("abc", "ab"));
+        assert!(!ct_eq_str("abc", "abcd"));
+        assert!(!ct_eq_str("", "x"));
+        assert!(ct_eq_str("", ""));
     }
 }

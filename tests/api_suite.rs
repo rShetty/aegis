@@ -474,13 +474,12 @@ async fn egress_log_and_stats_surface_check_outcomes() {
     assert_eq!(resp.status(), 200);
     let rows: serde_json::Value = resp.json().await.unwrap();
     let rows = rows.as_array().unwrap();
-    // NOTE (#8 audit observation): allowed-by-policy checks currently return
-    // from EgressEngine::check WITHOUT an audit row, so only the blocked
-    // check appears. README line 97 promises every check is logged; closing
-    // that gap is a #12 deep-audit finding.
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["status"], "blocked");
-    assert_eq!(rows[0]["destination"], "blocked.example.com");
+    // Both verdicts are audited (#12 F1): allowed and blocked checks each
+    // get an egress_log row.
+    assert_eq!(rows.len(), 2);
+    let statuses: Vec<&str> = rows.iter().map(|r| r["status"].as_str().unwrap()).collect();
+    assert!(statuses.contains(&"allowed"));
+    assert!(statuses.contains(&"blocked"));
     for row in rows {
         assert!(row["timestamp"].as_str().is_some());
         assert!(row["destination"].as_str().is_some());
@@ -494,9 +493,9 @@ async fn egress_log_and_stats_surface_check_outcomes() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let stats: serde_json::Value = resp.json().await.unwrap();
-    // Only the blocked check produced an audit row (see NOTE above).
-    assert_eq!(stats["total_requests"], 1);
-    assert_eq!(stats["allowed"], 0);
+    // Both verdicts counted (#12 F1).
+    assert_eq!(stats["total_requests"], 2);
+    assert_eq!(stats["allowed"], 1);
     assert_eq!(stats["blocked"], 1);
 
     tx.send(()).unwrap();
@@ -654,9 +653,12 @@ async fn load_smoke_500_sequential_checks_under_one_second() {
         "500 sequential checks took {elapsed:?}, budget is 1s"
     );
 
-    // Audit rows for allowed-by-policy checks are currently NOT written
-    // (EgressEngine::check returns early) — a #12 finding. The load
-    // assertion here is the HTTP path completing 500 times.
+    // Every check produced an audit row (#12 F1) and the DB write did not
+    // blow the latency budget.
+    let stats = state.db.egress_stats().unwrap();
+    assert_eq!(stats["total_requests"], 500);
+    assert_eq!(stats["allowed"], 500);
+
     println!("500 sequential checks completed in {elapsed:?}");
     tx.send(()).unwrap();
     handle.await.unwrap();

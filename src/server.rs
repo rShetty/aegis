@@ -284,17 +284,25 @@ async fn check_egress(
     State(state): State<AppState>,
     Json(req): Json<CheckEgressRequest>,
 ) -> Result<Json<serde_json::Value>, AegisError> {
-    let egress = state.egress.clone();
-    let agent_id = req.agent_id.clone();
-    let destination = req.destination.clone();
-    run_blocking(move || egress.check(agent_id.as_deref(), &destination)).await?;
+    let CheckEgressRequest {
+        agent_id,
+        destination,
+    } = req;
+    // Geo residency check FIRST (#12 F2): it is part of the verdict. Running
+    // it after EgressEngine::check used to persist an "allowed" audit row
+    // for requests that were then rejected by the geo gate.
     let geo = state.geo.clone();
-    let destination = req.destination.clone();
-    run_blocking(move || geo.check_destination(&destination)).await?;
+    let destination_for_geo = destination.clone();
+    run_blocking(move || geo.check_destination(&destination_for_geo)).await?;
+
+    let egress = state.egress.clone();
+    let agent_for_check = agent_id.clone();
+    let destination_for_check = destination.clone();
+    run_blocking(move || egress.check(agent_for_check.as_deref(), &destination_for_check)).await?;
     Ok(Json(serde_json::json!({
         "allowed": true,
-        "destination": req.destination,
-        "agent_id": req.agent_id,
+        "destination": destination,
+        "agent_id": agent_id,
     })))
 }
 
@@ -371,7 +379,11 @@ async fn egress_log(
     State(state): State<AppState>,
     Query(params): Query<LogQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, AegisError> {
-    let limit = params.limit.unwrap_or(100);
+    // Clamp `limit` (#12 F3): a raw negative value flows into SQLite's LIMIT
+    // where it means "unlimited" (full-table dump of the audit log), and an
+    // unbounded positive lets one request allocate unbounded memory. Clamp
+    // into [0, 1000] instead of rejecting, so existing callers keep working.
+    let limit = params.limit.unwrap_or(100).clamp(0, 1000);
     let db = state.db.clone();
     let log = run_blocking(move || db.list_egress_log(limit)).await?;
     Ok(Json(log))
@@ -484,13 +496,52 @@ async fn check_geo(
     State(state): State<AppState>,
     Json(req): Json<CheckGeoRequest>,
 ) -> Result<Json<serde_json::Value>, AegisError> {
+    let CheckGeoRequest { destination } = req;
+    // Audit the geo verdict (#12 F7): this endpoint previously returned
+    // allow/deny with no egress_log row at all, leaving data-residency
+    // enforcement invisible to operators. Both outcomes are recorded.
     let geo = state.geo.clone();
-    let destination = req.destination.clone();
-    run_blocking(move || geo.check_destination(&destination)).await?;
-    Ok(Json(serde_json::json!({
-        "allowed": true,
-        "destination": req.destination,
-    })))
+    let destination_for_geo = destination.clone();
+    let outcome = run_blocking(move || geo.check_destination(&destination_for_geo)).await;
+    let db = state.db.clone();
+    match outcome {
+        Ok(()) => {
+            let destination_for_log = destination.clone();
+            run_blocking(move || {
+                db.log_egress(
+                    None,
+                    "127.0.0.1",
+                    &destination_for_log,
+                    "CONNECT",
+                    "allowed",
+                    None,
+                    None,
+                )
+            })
+            .await?;
+            Ok(Json(serde_json::json!({
+                "allowed": true,
+                "destination": destination,
+            })))
+        }
+        Err(err) => {
+            let reason = err.to_string();
+            let destination_for_log = destination.clone();
+            run_blocking(move || {
+                db.log_egress(
+                    None,
+                    "127.0.0.1",
+                    &destination_for_log,
+                    "CONNECT",
+                    "blocked",
+                    Some(&reason),
+                    None,
+                )
+            })
+            .await?;
+            Err(err)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -538,5 +589,211 @@ mod tests {
     #[test]
     fn cors_invalid_origin_rejected_at_build() {
         assert!(build_cors(&["not a valid origin\n".to_string()]).is_err());
+    }
+
+    // ---------------- audit integrity (#12 F1/F2) ----------------
+
+    fn test_state(geo_blocked: Vec<String>) -> (tempfile::TempDir, AppState) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::new(":memory:").unwrap());
+        let config = Config {
+            server: crate::config::ServerConfig {
+                host: "127.0.0.1".into(),
+                port: 0,
+                cors_allowed_origins: vec![],
+            },
+            database: crate::config::DatabaseConfig {
+                path: tmp.path().join("unused.db").to_string_lossy().to_string(),
+            },
+            egress: crate::config::EgressConfig {
+                default_policy: "deny".into(),
+                max_request_size_bytes: 1 << 20,
+                max_connections_per_agent: 10,
+                bandwidth_limit_kbps: 1024,
+                log_retention_days: 30,
+            },
+            attestation: crate::config::AttestationConfig {
+                enabled: true,
+                require_attestation: false,
+            },
+            geo: crate::config::GeoConfig {
+                enabled: !geo_blocked.is_empty(),
+                blocked_regions: geo_blocked,
+            },
+        };
+        (tmp, AppState::new(db, &config, None))
+    }
+
+    #[tokio::test]
+    async fn geo_blocked_request_does_not_leave_a_false_allowed_row() {
+        let (_tmp, state) = test_state(vec!["CN".to_string()]);
+        state.db.add_egress_policy("agent-1", "*", "allow").unwrap();
+
+        // Geo gate fires before the egress engine writes anything.
+        let app = build_router(state.clone()).unwrap();
+        let resp = axum::body::to_bytes(
+            tower::ServiceExt::oneshot(
+                app,
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/egress/check")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"agent_id":"agent-1","destination":"https://evil.cn/data"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body(),
+            64 * 1024,
+        )
+        .await
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        assert!(body["error"].as_str().unwrap().contains("residency"));
+
+        // The audit trail must show the attempt as blocked — not the
+        // pre-geo "allowed" row the old ordering persisted.
+        let log = state.db.list_egress_log(10).unwrap();
+        assert_eq!(log.len(), 0, "geo rejection happens before any audit write");
+        let stats = state.db.egress_stats().unwrap();
+        assert_eq!(stats["allowed"], 0);
+    }
+
+    #[tokio::test]
+    async fn geo_ok_request_still_flows_through_egress_engine() {
+        let (_tmp, state) = test_state(vec!["CN".to_string()]);
+        state
+            .db
+            .add_egress_policy("agent-1", "api.github.com", "allow")
+            .unwrap();
+
+        let app = build_router(state.clone()).unwrap();
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/egress/check")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"agent_id":"agent-1","destination":"https://api.github.com"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // F1: the allowed verdict is now audited.
+        let log = state.db.list_egress_log(10).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0]["status"], "allowed");
+    }
+
+    // ---------------- log limit clamping (#12 F3) ----------------
+
+    #[tokio::test]
+    async fn geo_check_endpoint_writes_audit_rows_for_both_verdicts() {
+        let (_tmp, state) = test_state(vec!["CN".to_string()]);
+
+        // Blocked by geo.
+        let app = build_router(state.clone()).unwrap();
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/geo/check")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"destination":"https://evil.cn/data"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 403);
+
+        // Allowed by geo.
+        let app = build_router(state.clone()).unwrap();
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/geo/check")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"destination":"https://api.github.com"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // Both verdicts are in the audit trail (#12 F7).
+        let log = state.db.list_egress_log(10).unwrap();
+        assert_eq!(log.len(), 2);
+        let statuses: Vec<&str> = log.iter().map(|r| r["status"].as_str().unwrap()).collect();
+        assert!(statuses.contains(&"allowed"));
+        assert!(statuses.contains(&"blocked"));
+        let blocked = log.iter().find(|r| r["status"] == "blocked").unwrap();
+        assert!(blocked["reason"].as_str().unwrap().contains("residency"));
+    }
+
+    #[tokio::test]
+    async fn log_limit_is_clamped() {
+        let (_tmp, state) = test_state(vec![]);
+        // Seed 5 rows.
+        for i in 0..5 {
+            state
+                .db
+                .log_egress(
+                    Some("agent-1"),
+                    "127.0.0.1",
+                    &format!("host-{i}.example.com"),
+                    "CONNECT",
+                    "allowed",
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+
+        let build_req = |uri: String| {
+            axum::http::Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+
+        // Negative limit must NOT mean "unlimited dump" (SQLite LIMIT -1).
+        let app = build_router(state.clone()).unwrap();
+        let resp =
+            tower::ServiceExt::oneshot(app, build_req("/api/egress/log?limit=-5".to_string()))
+                .await
+                .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            rows.as_array().unwrap().len(),
+            0,
+            "negative limit clamps to 0 rows, never an unlimited dump"
+        );
+
+        // A huge positive limit is capped at the 1000 ceiling; here it
+        // returns all 5 rows without unbounded allocation.
+        let app = build_router(state.clone()).unwrap();
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            build_req(format!("/api/egress/log?limit={}", i64::MAX)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
     }
 }

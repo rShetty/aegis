@@ -53,7 +53,23 @@ impl EgressEngine {
         if let Some(agent_id) = agent_id {
             let policy = self.db.check_egress(agent_id, &dest_host)?;
             match policy {
-                Some(action) if action == "allow" => return Ok(()),
+                Some(action) if action == "allow" => {
+                    // Audit the allowed verdict too (#12 F1): the README
+                    // guarantees every check — allowed or blocked — lands in
+                    // egress_log. The bare early-return silently skipped the
+                    // audit row for exactly the traffic an operator most
+                    // needs evidence of.
+                    self.db.log_egress(
+                        Some(agent_id),
+                        "127.0.0.1",
+                        &dest_host,
+                        "CONNECT",
+                        "allowed",
+                        None,
+                        None,
+                    )?;
+                    return Ok(());
+                }
                 Some(action) if action == "deny" => {
                     self.db.log_egress(
                         Some(agent_id),
@@ -142,6 +158,45 @@ mod tests {
             .unwrap();
         let result = engine.check(Some("agent-1"), "https://api.github.com/repos");
         assert!(result.is_ok());
+    }
+
+    // ---------------- allowed checks are audited (#12 F1) ----------------
+
+    #[test]
+    fn allowed_by_policy_writes_an_audit_row() {
+        let engine = create_engine();
+        engine
+            .db
+            .add_egress_policy("agent-1", "api.github.com", "allow")
+            .unwrap();
+        engine
+            .check(Some("agent-1"), "https://api.github.com/repos")
+            .unwrap();
+        let log = engine.db.list_egress_log(10).unwrap();
+        assert_eq!(log.len(), 1, "allowed checks must be audited too");
+        assert_eq!(log[0]["status"], "allowed");
+        assert_eq!(log[0]["agent_id"], "agent-1");
+        assert_eq!(log[0]["destination"], "api.github.com");
+        assert_eq!(log[0]["reason"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn default_allow_policy_writes_an_audit_row() {
+        let db = Arc::new(Database::new(":memory:").unwrap());
+        let config = EgressConfig {
+            default_policy: "allow".to_string(),
+            max_request_size_bytes: 1024 * 1024,
+            max_connections_per_agent: 10,
+            bandwidth_limit_kbps: 1024,
+            log_retention_days: 30,
+        };
+        let engine = EgressEngine::new(db, config, false);
+        engine
+            .check(Some("agent-1"), "https://anything.example")
+            .unwrap();
+        let log = engine.db.list_egress_log(10).unwrap();
+        assert_eq!(log.len(), 1, "default-allow verdicts must be audited");
+        assert_eq!(log[0]["status"], "allowed");
     }
 
     #[test]
