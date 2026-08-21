@@ -95,7 +95,10 @@ as a demo-grade heuristic.
 - Binds to `127.0.0.1` by default; CORS is deny-by-default with an explicit
   origin allowlist.
 - Every check (allowed or blocked) is appended to a SQLite `egress_log` with
-  timestamp, reason, and status; readable via admin-only endpoints.
+  timestamp, reason, and status; readable via admin-only endpoints. Rows older
+  than `log_retention_days` (default 30) are deleted by an hourly background
+  prune and on demand via `POST /api/egress/prune`; prune counters appear in
+  `/api/egress/stats`.
 - Fail-fast strict config validation; graceful shutdown on SIGINT/SIGTERM;
   blocking DB work stays off the async runtime.
 
@@ -140,7 +143,8 @@ export AEGIS_ADMIN_TOKEN="$(openssl rand -hex 32)"
 | `GET/POST /api/egress/policies/{agent_id}` | bearer | inspect / add policies |
 | `DELETE /api/egress/policies/{agent_id}/{id}` | bearer | remove a policy |
 | `GET /api/egress/log?limit=N` | bearer | recent audit rows |
-| `GET /api/egress/stats` | bearer | aggregate counts |
+| `GET /api/egress/stats` | bearer | aggregate counts + prune counters |
+| `POST /api/egress/prune` | bearer | delete audit rows older than `log_retention_days` |
 | `POST /api/attestation/attestate` | bearer | register (agent_id, sha256(path)) |
 | `GET /api/attestation/agents` | bearer | registered agents |
 
@@ -160,6 +164,8 @@ path = "/var/lib/aegis/aegis.db"
 
 [egress]
 default_policy = "deny"
+# Audit rows older than this are pruned hourly (and via POST /api/egress/prune).
+log_retention_days = 30
 
 [attestation]
 enabled = true

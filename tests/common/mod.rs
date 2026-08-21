@@ -26,6 +26,7 @@ pub fn test_config(db_path: &str) -> Config {
             max_request_size_bytes: 1_048_576,
             max_connections_per_agent: 10,
             bandwidth_limit_kbps: 1024,
+            log_retention_days: 30,
         },
         attestation: AttestationConfig {
             enabled: true,
@@ -38,12 +39,17 @@ pub fn test_config(db_path: &str) -> Config {
     }
 }
 
-/// Build the router from a config.
-pub fn app_from_config(config: &Config, admin_token: Option<&str>) -> axum::Router {
+/// Build the shared `AppState` for a config (used directly by tests that need
+/// to seed the database or spawn background tasks against the same state).
+pub fn state_from_config(config: &Config, admin_token: Option<&str>) -> AppState {
     let db = Arc::new(Database::new(&config.database.path).unwrap());
     let token = admin_token.map(AdminToken::new);
-    let state = AppState::new(db, config, token);
-    build_router(state).unwrap()
+    AppState::new(db, config, token)
+}
+
+/// Build the router from a config.
+pub fn app_from_config(config: &Config, admin_token: Option<&str>) -> axum::Router {
+    build_router(state_from_config(config, admin_token)).unwrap()
 }
 
 /// Bind an ephemeral port, serve the app, and return `(base_url, shutdown_tx,
@@ -57,7 +63,23 @@ pub async fn spawn_app(
     tokio::sync::oneshot::Sender<()>,
     tokio::task::JoinHandle<()>,
 ) {
-    let app = app_from_config(config, admin_token);
+    let (base, tx, handle, _state) = spawn_app_with_state(config, admin_token).await;
+    (base, tx, handle)
+}
+
+/// Like [`spawn_app`], but also returns the shared [`AppState`] so tests can
+/// seed rows through `state.db` and inspect `state.retention` counters.
+pub async fn spawn_app_with_state(
+    config: &Config,
+    admin_token: Option<&str>,
+) -> (
+    String,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+    AppState,
+) {
+    let state = state_from_config(config, admin_token);
+    let app = build_router(state.clone()).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -72,5 +94,5 @@ pub async fn spawn_app(
         .await
         .unwrap();
     });
-    (format!("http://{addr}"), tx, handle)
+    (format!("http://{addr}"), tx, handle, state)
 }

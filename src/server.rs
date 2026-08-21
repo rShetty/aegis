@@ -12,6 +12,8 @@
 //!   `AEGIS_INSECURE_DEV=1` is set explicitly.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use axum::{
     Json, Router,
@@ -21,6 +23,8 @@ use axum::{
     response::Response,
     routing::{delete, get, post},
 };
+use chrono::Utc;
+use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
@@ -99,6 +103,34 @@ pub struct AppState {
     /// open and a loud warning is logged at startup.
     pub admin_token: Option<AdminToken>,
     pub cors_allowed_origins: Arc<Vec<String>>,
+    /// Shared counters for egress_log retention pruning (#10).
+    pub retention: Arc<RetentionState>,
+}
+
+/// Bookkeeping for `egress_log` retention (#10): the configured window plus
+/// prune counters surfaced through `/api/egress/stats`.
+pub struct RetentionState {
+    /// Delete log rows older than this many days.
+    pub retention_days: u64,
+    /// Cumulative rows removed since server start (background task + manual
+    /// endpoint combined).
+    pub pruned_total: AtomicU64,
+    /// Rows removed by the most recent prune that actually deleted rows
+    /// (idle runs do not reset this).
+    pub last_pruned: AtomicU64,
+    /// RFC3339 timestamp of the most recent prune that deleted rows.
+    pub last_prune_at: Mutex<Option<String>>,
+}
+
+impl RetentionState {
+    fn new(retention_days: u64) -> Self {
+        RetentionState {
+            retention_days,
+            pruned_total: AtomicU64::new(0),
+            last_pruned: AtomicU64::new(0),
+            last_prune_at: Mutex::new(None),
+        }
+    }
 }
 
 impl AppState {
@@ -120,8 +152,47 @@ impl AppState {
             geo,
             admin_token,
             cors_allowed_origins: Arc::new(config.server.cors_allowed_origins.clone()),
+            retention: Arc::new(RetentionState::new(config.egress.log_retention_days)),
         }
     }
+}
+
+/// Prune expired `egress_log` rows once, updating the shared retention
+/// counters. Returns the number of rows deleted this run.
+async fn run_prune_once(state: &AppState) -> Result<u64, AegisError> {
+    let retention = state.retention.clone();
+    let db = state.db.clone();
+    let pruned = run_blocking(move || db.prune_egress_log(retention.retention_days)).await?;
+    if pruned > 0 {
+        tracing::info!(pruned, "pruned expired egress_log rows");
+        // Only record prunes that actually removed rows: idle ticks must not
+        // reset `last_pruned`/`last_prune_at` to zero.
+        let retention = state.retention.clone();
+        retention.pruned_total.fetch_add(pruned, Ordering::Relaxed);
+        retention.last_pruned.store(pruned, Ordering::Relaxed);
+        *retention.last_prune_at.lock() = Some(Utc::now().to_rfc3339());
+    }
+    Ok(pruned)
+}
+
+/// Spawn the background retention loop (#10).
+///
+/// Prunes once immediately at startup, then every `period`. The returned task
+/// must be aborted after the server shuts down; callers own its lifetime.
+pub fn spawn_retention_task(state: &AppState, period: Duration) -> tokio::task::JoinHandle<()> {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if let Err(e) = run_prune_once(&state).await {
+                // A failed prune must never take the control plane down;
+                // the next tick retries.
+                tracing::error!(error = %e, "background egress_log prune failed");
+            }
+        }
+    })
 }
 
 async fn auth_middleware(
@@ -182,6 +253,7 @@ pub fn build_router(state: AppState) -> Result<Router, AegisError> {
         )
         .route("/api/egress/log", get(egress_log))
         .route("/api/egress/stats", get(egress_stats))
+        .route("/api/egress/prune", post(prune_egress_log))
         .route("/api/attestation/attestate", post(attestate_agent))
         .route("/api/attestation/verify", post(verify_agent))
         .route("/api/attestation/agents", get(list_attested))
@@ -314,8 +386,30 @@ async fn egress_stats(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, AegisError> {
     let db = state.db.clone();
-    let stats = run_blocking(move || db.egress_stats()).await?;
+    let mut stats = run_blocking(move || db.egress_stats()).await?;
+    // Retention bookkeeping (#10): prune counters live in memory (since
+    // server start), the retention window comes from config.
+    let retention = &state.retention;
+    stats["retention"] = serde_json::json!({
+        "retention_days": retention.retention_days,
+        "pruned_total": retention.pruned_total.load(Ordering::Relaxed),
+        "last_pruned": retention.last_pruned.load(Ordering::Relaxed),
+        "last_prune_at": retention.last_prune_at.lock().clone(),
+    });
     Ok(Json(stats))
+}
+
+/// Manual prune trigger (#10). Admin-only by virtue of not being on the data
+/// plane; uses the configured `log_retention_days` window.
+async fn prune_egress_log(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, AegisError> {
+    let pruned = run_prune_once(&state).await?;
+    Ok(Json(serde_json::json!({
+        "pruned": pruned,
+        "retention_days": state.retention.retention_days,
+        "pruned_total": state.retention.pruned_total.load(Ordering::Relaxed),
+    })))
 }
 
 #[derive(serde::Deserialize)]
@@ -425,6 +519,7 @@ mod tests {
     fn admin_path_classification() {
         assert!(is_admin_path("/api/egress/log"));
         assert!(is_admin_path("/api/egress/stats"));
+        assert!(is_admin_path("/api/egress/prune"));
         assert!(is_admin_path("/api/egress/policies/agent-1"));
         assert!(is_admin_path("/api/attestation/attestate"));
         assert!(is_admin_path("/api/attestation/agents"));

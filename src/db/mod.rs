@@ -175,14 +175,63 @@ impl Database {
         reason: Option<&str>,
         size_bytes: Option<i64>,
     ) -> Result<()> {
-        let conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
+        self.log_egress_at(
+            agent_id,
+            source_ip,
+            destination,
+            method,
+            status,
+            reason,
+            size_bytes,
+            &now,
+        )
+    }
+
+    /// Insert an egress log row with an explicit RFC3339 timestamp.
+    ///
+    /// Production callers should prefer [`Database::log_egress`]; this variant
+    /// exists for retention tests and operator backfill of historical rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_egress_at(
+        &self,
+        agent_id: Option<&str>,
+        source_ip: &str,
+        destination: &str,
+        method: &str,
+        status: &str,
+        reason: Option<&str>,
+        size_bytes: Option<i64>,
+        timestamp: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO egress_log (agent_id, source_ip, destination, method, status, reason, size_bytes, timestamp)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            params![agent_id, source_ip, destination, method, status, reason, size_bytes, now],
+            params![agent_id, source_ip, destination, method, status, reason, size_bytes, timestamp],
         )?;
         Ok(())
+    }
+
+    /// Delete `egress_log` rows strictly older than `retention_days`.
+    ///
+    /// Timestamps are stored as RFC3339 strings in UTC (same formatting as
+    /// [`Utc::now().to_rfc3339()`]), so lexicographic comparison against the
+    /// computed cutoff is order-correct. Returns the number of deleted rows.
+    pub fn prune_egress_log(&self, retention_days: u64) -> Result<u64> {
+        let days = i64::try_from(retention_days).map_err(|_| {
+            crate::errors::AegisError::Config("log_retention_days is too large".to_string())
+        })?;
+        let delta = chrono::Duration::try_days(days).ok_or_else(|| {
+            crate::errors::AegisError::Config("log_retention_days is out of range".to_string())
+        })?;
+        let cutoff = (Utc::now() - delta).to_rfc3339();
+        let conn = self.conn.lock();
+        let deleted = conn.execute(
+            "DELETE FROM egress_log WHERE timestamp < ?1",
+            params![cutoff],
+        )?;
+        Ok(deleted as u64)
     }
 
     pub fn list_egress_log(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
@@ -295,5 +344,100 @@ impl Database {
             "allowed": allowed,
             "blocked": blocked,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mem_db() -> Database {
+        Database::new(":memory:").unwrap()
+    }
+
+    /// Seed a log row at `age_days` in the past and return nothing; the
+    /// explicit-timestamp insert is what retention tests rely on.
+    fn seed(db: &Database, agent: &str, destination: &str, age_days: u64) {
+        let ts = (Utc::now() - chrono::Duration::try_days(age_days as i64).unwrap()).to_rfc3339();
+        db.log_egress_at(
+            Some(agent),
+            "127.0.0.1",
+            destination,
+            "CONNECT",
+            "allowed",
+            None,
+            None,
+            &ts,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn prune_removes_only_rows_older_than_retention() {
+        let db = mem_db();
+        seed(&db, "agent-1", "old.example.com", 40);
+        seed(&db, "agent-1", "older.example.com", 365);
+        seed(&db, "agent-1", "fresh.example.com", 1);
+
+        let pruned = db.prune_egress_log(30).unwrap();
+        assert_eq!(pruned, 2, "the two expired rows must be deleted");
+
+        let remaining = db.list_egress_log(10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0]["destination"], "fresh.example.com");
+    }
+
+    #[test]
+    fn prune_with_nothing_expired_returns_zero_and_keeps_rows() {
+        let db = mem_db();
+        seed(&db, "agent-1", "a.example.com", 5);
+        seed(&db, "agent-1", "b.example.com", 0);
+        assert_eq!(db.prune_egress_log(30).unwrap(), 0);
+        assert_eq!(db.list_egress_log(10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn prune_on_empty_table_is_zero() {
+        let db = mem_db();
+        assert_eq!(db.prune_egress_log(30).unwrap(), 0);
+    }
+
+    #[test]
+    fn repeated_prunes_do_not_double_count_deletions() {
+        let db = mem_db();
+        seed(&db, "agent-1", "old.example.com", 90);
+        assert_eq!(db.prune_egress_log(30).unwrap(), 1);
+        assert_eq!(db.prune_egress_log(30).unwrap(), 0, "already deleted");
+    }
+
+    #[test]
+    fn pruned_rows_are_reflected_in_stats() {
+        let db = mem_db();
+        seed(&db, "agent-1", "old.example.com", 40);
+        seed(&db, "agent-1", "fresh.example.com", 2);
+        let _ = db.prune_egress_log(30).unwrap();
+        let stats = db.egress_stats().unwrap();
+        assert_eq!(stats["total_requests"], 1);
+        assert_eq!(stats["allowed"], 1);
+        assert_eq!(stats["blocked"], 0);
+    }
+
+    #[test]
+    fn log_egress_at_preserves_explicit_timestamp() {
+        let db = mem_db();
+        let ts = (Utc::now() - chrono::Duration::try_hours(48).unwrap()).to_rfc3339();
+        db.log_egress_at(
+            Some("a"),
+            "127.0.0.1",
+            "x.com",
+            "CONNECT",
+            "blocked",
+            None,
+            None,
+            &ts,
+        )
+        .unwrap();
+        let rows = db.list_egress_log(10).unwrap();
+        assert_eq!(rows[0]["timestamp"], serde_json::json!(ts));
     }
 }

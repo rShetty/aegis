@@ -30,6 +30,15 @@ pub struct EgressConfig {
     pub max_request_size_bytes: usize,
     pub max_connections_per_agent: usize,
     pub bandwidth_limit_kbps: usize,
+    /// Rows in `egress_log` older than this many days are deleted by the
+    /// background pruning task (#10). Defaults to 30 when omitted; must be
+    /// >= 1 — audit logs are never kept forever by default.
+    #[serde(default = "default_log_retention_days")]
+    pub log_retention_days: u64,
+}
+
+fn default_log_retention_days() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +71,7 @@ impl Default for Config {
                 max_request_size_bytes: 10 * 1024 * 1024,
                 max_connections_per_agent: 20,
                 bandwidth_limit_kbps: 10240,
+                log_retention_days: default_log_retention_days(),
             },
             attestation: AttestationConfig {
                 enabled: true,
@@ -119,6 +129,11 @@ impl Config {
         if self.server.port == 0 {
             return Err(anyhow::anyhow!("server.port must be a nonzero port"));
         }
+        if self.egress.log_retention_days == 0 {
+            return Err(anyhow::anyhow!(
+                "egress.log_retention_days must be at least 1 (audit rows are pruned, never kept forever by default; set a larger value to retain longer)"
+            ));
+        }
         Ok(())
     }
 }
@@ -157,6 +172,7 @@ default_policy = "deny"
 max_request_size_bytes = 10485760
 max_connections_per_agent = 20
 bandwidth_limit_kbps = 10240
+log_retention_days = 30
 
 [attestation]
 enabled = true
@@ -234,6 +250,24 @@ port = 8686
         let mut no_db = config.clone();
         no_db.database.path = "  ".into();
         assert!(no_db.validate().is_err());
+    }
+
+    #[test]
+    fn test_log_retention_days_defaults_when_omitted() {
+        // Existing config files without the field must keep parsing (#10).
+        let toml = valid_toml().replace("log_retention_days = 30\n", "");
+        let path = write_temp_config(&toml);
+        let config = Config::load(&path).expect("config without log_retention_days must load");
+        assert_eq!(config.egress.log_retention_days, 30);
+    }
+
+    #[test]
+    fn test_zero_log_retention_days_rejected() {
+        let toml = valid_toml().replace("log_retention_days = 30", "log_retention_days = 0");
+        let path = write_temp_config(&toml);
+        let err = Config::load(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("log_retention_days"), "got: {msg}");
     }
 
     #[test]

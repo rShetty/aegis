@@ -84,9 +84,18 @@ async fn main() -> anyhow::Result<()> {
             let db = Arc::new(Database::new(&config.database.path)?);
             let state = AppState::new(db, &config, admin_token);
 
-            let app = build_router(state)?;
+            let app = build_router(state.clone())?;
             let addr = format!("{}:{}", config.server.host, config.server.port);
             tracing::info!("Aegis starting on {}", addr);
+            tracing::info!(
+                "egress_log retention: {} day(s); manual prune via POST /api/egress/prune",
+                state.retention.retention_days
+            );
+
+            // Background egress_log pruning (#10). Prunes once at startup,
+            // then hourly; aborted after the server drains.
+            let retention_task =
+                aegis::server::spawn_retention_task(&state, std::time::Duration::from_secs(3600));
 
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             tracing::info!("Aegis listening on {}", addr);
@@ -97,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
             .with_graceful_shutdown(shutdown_signal())
             .await?;
 
+            retention_task.abort();
             tracing::info!("Aegis shut down cleanly");
         }
     }

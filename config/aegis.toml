@@ -12,6 +12,8 @@ default_policy = "deny"
 max_request_size_bytes = 10485760
 max_connections_per_agent = 20
 bandwidth_limit_kbps = 10240
+# Audit rows in egress_log older than this are pruned automatically (#10).
+log_retention_days = 30
 
 [attestation]
 enabled = true

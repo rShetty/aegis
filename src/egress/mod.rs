@@ -121,6 +121,7 @@ mod tests {
             max_request_size_bytes: 1024 * 1024,
             max_connections_per_agent: 10,
             bandwidth_limit_kbps: 1024,
+            log_retention_days: 30,
         };
         EgressEngine::new(db, config, require_attestation)
     }
