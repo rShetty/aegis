@@ -1,19 +1,12 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::{
-    Json, Router,
-    extract::{Path, Query, State},
-    http::StatusCode,
-    routing::{get, post},
+use aegis::{
+    config::Config,
+    db::Database,
+    server::{AdminToken, AppState, build_router},
 };
 use clap::{Parser, Subcommand};
-use serde::Deserialize;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
-
-use aegis::{
-    attestation::AttestationEngine, config::Config, db::Database, egress::EgressEngine,
-    geo::GeoEngine,
-};
 
 #[derive(Parser)]
 #[command(name = "aegis")]
@@ -32,12 +25,36 @@ enum Commands {
     Init,
 }
 
-#[derive(Clone)]
-struct AppState {
-    db: Arc<Database>,
-    egress: Arc<EgressEngine>,
-    attestation: Arc<AttestationEngine>,
-    geo: Arc<GeoEngine>,
+/// Resolve the admin token from the environment (#1).
+///
+/// - `AEGIS_ADMIN_TOKEN` set  -> token used for the admin plane.
+/// - unset in release builds  -> refuse to start unless
+///   `AEGIS_INSECURE_DEV=1` is set explicitly.
+/// - unset in debug builds    -> warn loudly and continue (development only).
+fn resolve_admin_token() -> anyhow::Result<Option<AdminToken>> {
+    if let Ok(raw) = std::env::var("AEGIS_ADMIN_TOKEN")
+        && !raw.trim().is_empty()
+    {
+        return Ok(Some(AdminToken::new(&raw)));
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let insecure = std::env::var("AEGIS_INSECURE_DEV").is_ok_and(|v| v == "1");
+        if !insecure {
+            anyhow::bail!(
+                "refusing to start: AEGIS_ADMIN_TOKEN is not set (required in release builds). \
+                 For local development ONLY, set AEGIS_INSECURE_DEV=1"
+            );
+        }
+        tracing::warn!("AEGIS_INSECURE_DEV=1: admin endpoints are UNAUTHENTICATED");
+    }
+    #[cfg(debug_assertions)]
+    {
+        tracing::warn!(
+            "AEGIS_ADMIN_TOKEN not set: admin endpoints are UNAUTHENTICATED (debug build)"
+        );
+    }
+    Ok(None)
 }
 
 #[tokio::main]
@@ -59,201 +76,68 @@ async fn main() -> anyhow::Result<()> {
             println!("Created config.toml");
         }
         Commands::Serve { config } => {
-            let config = Config::load(&config).unwrap_or_default();
+            // Fail fast on missing/invalid configuration (#3): never fall
+            // back to defaults for a security control.
+            let config = Config::load(&config)?;
+
+            let admin_token = resolve_admin_token()?;
             let db = Arc::new(Database::new(&config.database.path)?);
-            let egress = Arc::new(EgressEngine::new(db.clone(), config.egress.clone()));
-            let attestation = Arc::new(AttestationEngine::new(
-                db.clone(),
-                config.attestation.enabled,
-            ));
-            let geo = Arc::new(GeoEngine::new(&config.geo));
+            let state = AppState::new(db, &config, admin_token);
 
-            let state = AppState {
-                db,
-                egress,
-                attestation,
-                geo,
-            };
-
-            let app = create_router(state);
+            let app = build_router(state.clone())?;
             let addr = format!("{}:{}", config.server.host, config.server.port);
             tracing::info!("Aegis starting on {}", addr);
+            tracing::info!(
+                "egress_log retention: {} day(s); manual prune via POST /api/egress/prune",
+                state.retention.retention_days
+            );
+
+            // Background egress_log pruning (#10). Prunes once at startup,
+            // then hourly; aborted after the server drains.
+            let retention_task =
+                aegis::server::spawn_retention_task(&state, std::time::Duration::from_secs(3600));
 
             let listener = tokio::net::TcpListener::bind(&addr).await?;
-            axum::serve(listener, app).await?;
+            tracing::info!("Aegis listening on {}", addr);
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+
+            retention_task.abort();
+            tracing::info!("Aegis shut down cleanly");
         }
     }
 
     Ok(())
 }
 
-fn create_router(state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(health))
-        .route("/api/egress/check", post(check_egress))
-        .route(
-            "/api/egress/policies/{agent_id}",
-            get(list_policies).post(add_policy),
-        )
-        .route("/api/egress/log", get(egress_log))
-        .route("/api/egress/stats", get(egress_stats))
-        .route("/api/attestation/attestate", post(attestate_agent))
-        .route("/api/attestation/verify", post(verify_agent))
-        .route("/api/attestation/agents", get(list_attested))
-        .route("/api/geo/check", post(check_geo))
-        .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
-        .with_state(state)
-}
-
-async fn health() -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"status": "ok", "service": "aegis"})),
-    )
-}
-
-#[derive(Deserialize)]
-struct CheckEgressRequest {
-    agent_id: Option<String>,
-    destination: String,
-}
-
-async fn check_egress(
-    State(state): State<AppState>,
-    Json(req): Json<CheckEgressRequest>,
-) -> Result<Json<serde_json::Value>, aegis::errors::AegisError> {
-    state
-        .egress
-        .check(req.agent_id.as_deref(), &req.destination)?;
-    state.geo.check_destination(&req.destination)?;
-    Ok(Json(serde_json::json!({
-        "allowed": true,
-        "destination": req.destination,
-        "agent_id": req.agent_id,
-    })))
-}
-
-async fn list_policies(
-    State(state): State<AppState>,
-    Path(agent_id): Path<String>,
-) -> Result<Json<serde_json::Value>, aegis::errors::AegisError> {
-    let policies = state.db.get_egress_policies(&agent_id)?;
-    let result: Vec<serde_json::Value> = policies
-        .into_iter()
-        .map(|(dest, action, created)| {
-            serde_json::json!({"destination": dest, "action": action, "created_at": created})
-        })
-        .collect();
-    Ok(Json(
-        serde_json::json!({"agent_id": agent_id, "policies": result}),
-    ))
-}
-
-#[derive(Deserialize)]
-struct AddPolicyRequest {
-    destination: String,
-    action: String,
-}
-
-async fn add_policy(
-    State(state): State<AppState>,
-    Path(agent_id): Path<String>,
-    Json(req): Json<AddPolicyRequest>,
-) -> Result<Json<serde_json::Value>, aegis::errors::AegisError> {
-    state
-        .db
-        .add_egress_policy(&agent_id, &req.destination, &req.action)?;
-    Ok(Json(
-        serde_json::json!({"added": true, "agent_id": agent_id, "destination": req.destination, "action": req.action}),
-    ))
-}
-
-async fn egress_log(
-    State(state): State<AppState>,
-    Query(params): Query<LogQuery>,
-) -> Result<Json<Vec<serde_json::Value>>, aegis::errors::AegisError> {
-    let limit = params.limit.unwrap_or(100);
-    let log = state.db.list_egress_log(limit)?;
-    Ok(Json(log))
-}
-
-#[derive(Deserialize)]
-struct LogQuery {
-    limit: Option<i64>,
-}
-
-async fn egress_stats(
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, aegis::errors::AegisError> {
-    let stats = state.db.egress_stats()?;
-    Ok(Json(stats))
-}
-
-#[derive(Deserialize)]
-struct AttestateRequest {
-    agent_id: String,
-    binary_path: String,
-    pid: Option<i64>,
-}
-
-async fn attestate_agent(
-    State(state): State<AppState>,
-    Json(req): Json<AttestateRequest>,
-) -> Result<Json<serde_json::Value>, aegis::errors::AegisError> {
-    let hash = state
-        .attestation
-        .attestate(&req.agent_id, &req.binary_path, req.pid)?;
-    Ok(Json(serde_json::json!({
-        "attested": true,
-        "agent_id": req.agent_id,
-        "process_hash": hash,
-    })))
-}
-
-#[derive(Deserialize)]
-struct VerifyRequest {
-    agent_id: String,
-    binary_path: Option<String>,
-    process_hash: Option<String>,
-}
-
-async fn verify_agent(
-    State(state): State<AppState>,
-    Json(req): Json<VerifyRequest>,
-) -> Result<Json<serde_json::Value>, aegis::errors::AegisError> {
-    let verified = if let Some(path) = &req.binary_path {
-        state.attestation.verify(&req.agent_id, path)?
-    } else if let Some(hash) = &req.process_hash {
-        state.attestation.verify_hash(&req.agent_id, hash)?
-    } else {
-        false
+/// Future that resolves on SIGINT (Ctrl-C) or SIGTERM (#5), letting
+/// `with_graceful_shutdown` drain in-flight connections before exit.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl-C handler");
     };
-    Ok(Json(serde_json::json!({
-        "agent_id": req.agent_id,
-        "verified": verified,
-    })))
-}
 
-async fn list_attested(
-    State(state): State<AppState>,
-) -> Result<Json<Vec<serde_json::Value>>, aegis::errors::AegisError> {
-    let agents = state.db.list_attested_agents()?;
-    Ok(Json(agents))
-}
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
 
-#[derive(Deserialize)]
-struct CheckGeoRequest {
-    destination: String,
-}
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
 
-async fn check_geo(
-    State(state): State<AppState>,
-    Json(req): Json<CheckGeoRequest>,
-) -> Result<Json<serde_json::Value>, aegis::errors::AegisError> {
-    state.geo.check_destination(&req.destination)?;
-    Ok(Json(serde_json::json!({
-        "allowed": true,
-        "destination": req.destination,
-    })))
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    tracing::info!("shutdown signal received, draining connections");
 }
