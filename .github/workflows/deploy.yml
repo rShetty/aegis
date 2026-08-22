@@ -95,6 +95,13 @@ jobs:
             # Copy config
             cp config/aegis.toml /etc/aegis/aegis.toml
 
+            # Provision admin token once (required by release builds)
+            mkdir -p /etc/aegis
+            if [ ! -f /etc/aegis/aegis.env ]; then
+              echo "AEGIS_ADMIN_TOKEN=$(openssl rand -hex 32)" > /etc/aegis/aegis.env
+              chmod 600 /etc/aegis/aegis.env
+            fi
+
             # Build
             source "$HOME/.cargo/env"
             cargo build --release
