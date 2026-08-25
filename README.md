@@ -200,13 +200,15 @@ blocked_regions = []
 
 ## Role in the ecosystem
 
+Governance Hub is the unified admin console and sole browser-facing product.
+The backend control plane is:
+
 ```
-Hive          Patroclus       Relay          Miser        Sentiel        Aegis
-─────         ─────────       ─────          ─────        ───────        ─────
-Agent         Authz           MCP Proxy      Cost         Observability  Egress
-Runtime       Infrastructure  & Tool         Optimization & DLP          Verdicts
-& Orchestration                Gateway                    & Compliance   & Attestation
-```
+Hive          Argus           Patroclus       Relay          Miser        Sentiel        Aegis        Forge
+─────         ─────           ─────────       ─────          ─────        ───────        ─────        ─────
+Agent         OIDC            Authz           MCP            Cost         Observability  Egress       Supply Chain
+Runtime       Identity        Infrastructure  Gateway        Optimization & DLP          Verdicts     Trust
+& Orchestration               & Policy        & Search                                                              ```
 
 Aegis complements Patroclus (which tools may an agent use) and Relay (which MCP
 gateways mediate tool calls) by answering which raw network destinations an
