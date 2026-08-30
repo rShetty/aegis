@@ -1,0 +1,37 @@
+name: Temp:locate TS OAuth creds on VPS
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Connect to tailnet
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:hostinger
+
+      - name: Locate Tailscale OAuth credentials on VPS
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            set -uo pipefail
+            echo '== files mentioning TS_OAUTH or tailscale oauth =='
+            grep -rln -E 'TS_OAUTH|tailscale.*oauth|oauth.*tailscale' /root /home /etc /opt 2>/dev/null | head -20
+            echo '== bash history hints =='
+            grep -inE 'oauth|k1[0-9a-z]{20,}' /root/.bash_history /home/*/.bash_history 2>/dev/null | head -10
+            echo '== client-id-shaped tokens in small text files =='
+            find /root /home /etc /opt -maxdepth 4 -type f -size -20k 2>/dev/null |
+              xargs grep -lE '\bk1[0-9a-z]{20,}\b' 2>/dev/null | head -10
+            echo '== contents of candidate files =='
+            for f in $(find /root /home /etc /opt -maxdepth 4 -type f -size -20k 2>/dev/null |
+              xargs grep -lE '\bk1[0-9a-z]{20,}\b|TS_OAUTH' 2>/dev/null | head -5); do
+              echo "--- $f ---"
+              cat "$f"
+            done
