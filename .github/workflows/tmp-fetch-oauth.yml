@@ -1,4 +1,4 @@
-name: Temp:locate TS OAuth creds on VPS
+name: Temp:ops task on VPS
 
 on:
   workflow_dispatch:
@@ -14,24 +14,28 @@ jobs:
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:hostinger
 
-      - name: Locate Tailscale OAuth credentials on VPS
+      - name: Install forge nginx vhost from synced /opt checkout
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
-            set -uo pipefail
-            echo '== files mentioning TS_OAUTH or tailscale oauth =='
-            grep -rln -E 'TS_OAUTH|tailscale.*oauth|oauth.*tailscale' /root /home /etc /opt 2>/dev/null | head -20
-            echo '== bash history hints =='
-            grep -inE 'oauth|k1[0-9a-z]{20,}' /root/.bash_history /home/*/.bash_history 2>/dev/null | head -10
-            echo '== client-id-shaped tokens in small text files =='
-            find /root /home /etc /opt -maxdepth 4 -type f -size -20k 2>/dev/null |
-              xargs grep -lE '\bk1[0-9a-z]{20,}\b' 2>/dev/null | head -10
-            echo '== contents of candidate files =='
-            for f in $(find /root /home /etc /opt -maxdepth 4 -type f -size -20k 2>/dev/null |
-              xargs grep -lE '\bk1[0-9a-z]{20,}\b|TS_OAUTH' 2>/dev/null | head -5); do
-              echo "--- $f ---"
-              cat "$f"
-            done
+            set -euo pipefail
+            cd /opt/forge
+            git fetch origin main
+            git reset --hard origin/main
+            if [ -f deploy/nginx-vhost.conf ] && [ -d /etc/nginx/sites-available ]; then
+              install -m 644 deploy/nginx-vhost.conf /etc/nginx/sites-available/forge.conf
+              ln -sf /etc/nginx/sites-available/forge.conf /etc/nginx/sites-enabled/forge.conf
+              if nginx -t 2>/tmp/nginx-test.log; then
+                systemctl reload nginx
+                echo "nginx vhost installed and reloaded"
+              else
+                echo "WARNING: nginx -t failed; vhost staged but NOT reloaded:" >&2
+                cat /tmp/nginx-test.log >&2
+              fi
+            fi
+            systemctl is-active forge
+            curl -sf http://127.0.0.1:8788/health && echo " forge healthy"
+
